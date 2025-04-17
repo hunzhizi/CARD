@@ -49,6 +49,7 @@ class Tree:
         if self.is_empty():
             # 此时只取最后一个 token的 logits
             logits, ids = torch.topk(logits[0][-1], k=self.nodes_per_layer, dim=-1)
+            self.logits_buffer[self.tail].copy_(logits)
             self.weight_buffer[self.tail].copy_(logits)
             self.input_ids_buffer[self.tail].copy_(ids)
             self.parents_index[self.tail].copy_(self.rows)
@@ -61,12 +62,18 @@ class Tree:
         else:
             # 获取一层中的 每一个节点的logits
             logits, ids = torch.topk(logits[0], k=self.nodes_per_layer, dim=-1)
+            orig_logits = logits
             last_layer_weights = self.weight_buffer[self.tail - 1].unsqueeze(1)
             logits = logits * last_layer_weights
             flat_logits, flat_ids = logits.view(-1), ids.view(-1)
             global_top_logits, global_top_idx = torch.topk(flat_logits, k=self.nodes_per_layer, dim=-1)
             input_ids = flat_ids[global_top_idx]
             parents = global_top_idx // self.nodes_per_layer
+            # 做一个实验，如果第一个token 置信度很高的话就 pad掉其他token(剪枝)
+            # if global_top_logits[0] / global_top_logits[1] > 30:
+            #     global_top_logits[1:] = 0
+            orig_logits = orig_logits.view(-1)[global_top_idx]
+            self.logits_buffer[self.tail].copy_(orig_logits)
             self.weight_buffer[self.tail].copy_(global_top_logits)
             self.input_ids_buffer[self.tail].copy_(input_ids)
             self.parents_index[self.tail].copy_(parents)
@@ -84,10 +91,46 @@ class Tree:
                     attention_mask,
                     parents)
 
+
+    def dequeue(self,dequeue_num: int = 0) -> None:
+        # 用于目标模型验证成功后更新 cache
+        if self.size - dequeue_num < 0:
+            raise RuntimeError(f"Buffer is empty, cannot dequeue")
+        self.head = (self.head + dequeue_num) % self.buffer_capacity
+        self.size -= dequeue_num
+
+    def verified_update(self, correct_ids_index_path: torch.Tensor):
+        dequeue_num = correct_ids_index_path.size(0)
+        # 更新 mask
+        self.kv_mask = torch.zeros([self.nodes_per_layer, 0], dtype=torch.int8, device=self.kv_mask.device)
+        self.kv_cache_mask.fill_(0)
+        # 更新buffer
+        self.dequeue(dequeue_num)
+        # 更新 verified_pos_len
+        self.verified_pos_len += dequeue_num
+        if self.is_empty():
+            return
+        # 更新 logits 对验证失败的所有其他tokens 的路径进行剪枝
+        # 获取验证的最后一个tensor 的 index, id 可能会重复，所以 要index才行
+        parent_id = correct_ids_index_path[-1]
+        for i in range(self.size):
+            index = i + self.head
+            mask = torch.isin(self.parents_index[index], parent_id)
+            # 更新对应的weight 和 logits
+            self.weight_buffer[index] *= mask
+            self.logits_buffer[index] *= mask
+            parent_id = self.parents_index[mask]
+
+            # skip the first one
+            if i != 0 :
+                parents = self.parents_index[index]
+                self.kv_cache_mask[self.rows, parents] = 1
+                self.kv_mask = torch.cat([self.kv_mask[parents], self.kv_cache_mask], dim=1)
+
+
+
+
+
     def update(self, logits):
         # 根据验证序列 来更新 buffer
         pass
-
-if __name__ == '__main__':
-    result = 0.6 ** 22
-    print(result)
