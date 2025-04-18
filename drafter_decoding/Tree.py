@@ -113,19 +113,25 @@ class Tree:
         # 更新 logits 对验证失败的所有其他tokens 的路径进行剪枝
         # 获取验证的最后一个tensor 的 index, id 可能会重复，所以 要index才行
         parent_id = correct_ids_index_path[-1]
-        for i in range(self.size):
+
+        index = self.head
+        mask = torch.isin(self.parents_index[index], parent_id)
+        # 更新对应的weight 和 logits
+        self.logits_buffer[index] *= mask
+        self.weight_buffer[index] = self.logits_buffer[index].clone()
+        parent_id = self.input_ids_buffer[index][mask]
+        for i in range(1, self.size):
             index = (i + self.head) % self.buffer_capacity   # todo index 循环求余
             mask = torch.isin(self.parents_index[index], parent_id)
             # 更新对应的weight 和 logits
-            self.weight_buffer[index] *= mask
             self.logits_buffer[index] *= mask
-            parent_id = self.parents_index[index][mask]
+            self.weight_buffer[index] = self.logits_buffer[index] * self.logits_buffer[(index - 1) % self.buffer_capacity]
+            parent_id = self.input_ids_buffer[index][mask]
 
             # skip the first one
-            if i != 0 :
-                parents = self.parents_index[index]
-                self.kv_cache_mask[self.rows, parents] = 1
-                self.kv_mask = torch.cat([self.kv_mask[parents], self.kv_cache_mask], dim=1)
+            parents = self.parents_index[index]
+            self.kv_cache_mask[self.rows, parents] = 1
+            self.kv_mask = torch.cat([self.kv_mask[parents], self.kv_cache_mask], dim=1)
 
 
 
