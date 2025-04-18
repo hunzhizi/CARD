@@ -2,6 +2,7 @@ import time
 
 import torch.nn as nn
 import torch
+from numpy.ma.core import divide
 
 from .Tree import Tree
 from .modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
@@ -116,9 +117,11 @@ class DecodingModel(nn.Module):
                 position_ids=position_ids,
             )
             # 测试回滚效果
-            if len(tokens_id) == 9:
-                self._verified_update(tree, torch.tensor([3, 0, 0, 0], dtype=torch.int32))
-                tokens_id.clear()
+            if len(tokens_id) == 4:
+                self._verified_update(tree, torch.tensor([3, 0, 0, 0], dtype=torch.int32, device='cuda'))
+                tokens_id.pop()
+                tokens_id.pop()
+                tokens_id.pop()
             # outputs[0]： 表示的是 logits
             # 第一次推理节点的维度为 size(1,23,32000)
             # size(batch_size, seq_len, vocab_size)
@@ -144,23 +147,26 @@ class DecodingModel(nn.Module):
         indices = torch.arange(correct_ids_index_path.numel(), device=correct_ids_index_path.device,
                                dtype=correct_ids_index_path.dtype)
         indices = start + correct_ids_index_path + indices * nodes_per_layer
+        rest_kv = torch.arange(start + nodes_per_layer * tokens_len,self.past_key_values[0][0].shape[2],device=indices.device)
+        indices = torch.cat([indices, rest_kv],dim=0)
         for data in self.past_key_values_data_list:
             tgt = data[..., indices.to(data.device), :]
-            dst = data[..., start: start + tokens_len, :]
+            dst = data[..., start: start + indices.size(0), :]
             dst.copy_(tgt, non_blocking=True)
-        self.current_length_data.fill_(start + tokens_len)
+        self.current_length_data.fill_(start + indices.size(0))
         # 更新 verified_len
         self.verified_len += tokens_len
 
     # 传入正确的 路径，更新树并 进行 kv-cache的回滚
     # 由目标模型传过来的正确的更新序列
     def _verified_update(self, tree: Tree, correct_ids_index_path: torch.Tensor):
-        # 进行 kv——cache 回滚
-        self._rollback_kv_cache(correct_ids_index_path, tree.nodes_per_layer)
-        # 更新树
         # 规定 在 tensor 第一个位置为 验证序列长度
         length = int(correct_ids_index_path[0].item())
         # 正确的 token ids  index 序列
         correct_ids_index_path = correct_ids_index_path[1:length + 1]
+
+        # 进行 kv——cache 回滚
+        self._rollback_kv_cache(correct_ids_index_path, tree.nodes_per_layer)
+        # 更新树
         tree.verified_update(correct_ids_index_path)
 

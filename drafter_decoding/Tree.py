@@ -17,7 +17,7 @@ class Tree:
         self.logits_buffer: torch.Tensor = torch.zeros([max_depth, nodes_per_layer], device=device)
         self.weight_buffer: torch.Tensor = torch.zeros([max_depth, nodes_per_layer],dtype=torch.float64, device=device)
         self.input_ids_buffer: torch.Tensor = torch.zeros([max_depth, nodes_per_layer], device=device)
-        self.parents_index: torch.Tensor = torch.zeros([max_depth, nodes_per_layer], device=device)
+        self.parents_index: torch.Tensor = torch.zeros([max_depth, nodes_per_layer], dtype=torch.int, device=device)
         self.rows: torch.Tensor = torch.arange(nodes_per_layer, device=self.device)
         self.buffer_capacity: int = max_depth
         self.head: int = 0
@@ -114,12 +114,12 @@ class Tree:
         # 获取验证的最后一个tensor 的 index, id 可能会重复，所以 要index才行
         parent_id = correct_ids_index_path[-1]
         for i in range(self.size):
-            index = i + self.head
+            index = (i + self.head) % self.buffer_capacity   # todo index 循环求余
             mask = torch.isin(self.parents_index[index], parent_id)
             # 更新对应的weight 和 logits
             self.weight_buffer[index] *= mask
             self.logits_buffer[index] *= mask
-            parent_id = self.parents_index[mask]
+            parent_id = self.parents_index[index][mask]
 
             # skip the first one
             if i != 0 :
