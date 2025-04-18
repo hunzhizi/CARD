@@ -96,6 +96,7 @@ class DecodingModel(nn.Module):
         # decode 阶段，在 decode 阶段，只要没有被完全拒绝，每一次都要处理一层的树节点。
         # 通过 Tree 类进行管理
         tokens_id = []
+        debug_queue = []
 
         input_ids, position_ids, tree_attention_mask, parents = tree.enqueue(
             torch.softmax(outputs[0], dim=-1, dtype=torch.float32))
@@ -119,9 +120,9 @@ class DecodingModel(nn.Module):
             # 测试回滚效果
             if len(tokens_id) == 4:
                 self._verified_update(tree, torch.tensor([3, 0, 0, 0], dtype=torch.int32, device='cuda'))
-                tokens_id.pop()
-                tokens_id.pop()
-                tokens_id.pop()
+                debug_queue.append(tokens_id.pop(0))
+                debug_queue.append(tokens_id.pop(0))
+                debug_queue.append(tokens_id.pop(0))
             # outputs[0]： 表示的是 logits
             # 第一次推理节点的维度为 size(1,23,32000)
             # size(batch_size, seq_len, vocab_size)
@@ -133,8 +134,8 @@ class DecodingModel(nn.Module):
 
             tokens_id.append(input_ids[0][0].item())
             print(self.tokenizer.decode(input_ids[0]))
-            print(f"the best candidates are \n{self.tokenizer.decode(tokens_id)}")
-            print(f"the total len is {len(tokens_id)}")
+            print(f"the best candidates are \n{self.tokenizer.decode(debug_queue)}")
+            print(f"the total len is {len(debug_queue)}")
             print(f"{j}..{(time.perf_counter() - start_time)}............")
             j+=1
 
