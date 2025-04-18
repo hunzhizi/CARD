@@ -27,6 +27,7 @@ class Tree:
         self.verified_pos_len = verified_pos_len
         # 最佳 candidate path
         self.best_candidates = list()
+        self.chosen_id = -1 # 用于保存当cache全都被命中后的 logits 的选择，或者当被拒绝后重新选择的logits的 id
 
     def set_device(self, device: torch.device):
         self.device = device
@@ -47,8 +48,8 @@ class Tree:
         if self.is_full():
             raise RuntimeError(f"buffer_capacity: {self.buffer_capacity} is not enough")
         if self.is_empty():
-            # 此时只取最后一个 token的 logits
-            logits, ids = torch.topk(logits[0][-1], k=self.nodes_per_layer, dim=-1)
+            # 第一次推理只取最后一个 token的 logits，当被拒绝或者全部接受后更新，选择self.chosen_id 通过这个变量进行维护
+            logits, ids = torch.topk(logits[0][self.chosen_id], k=self.nodes_per_layer, dim=-1)
             self.logits_buffer[self.tail].copy_(logits)
             self.weight_buffer[self.tail].copy_(logits)
             self.input_ids_buffer[self.tail].copy_(ids)
@@ -109,6 +110,8 @@ class Tree:
         # 更新 verified_pos_len
         self.verified_pos_len += dequeue_num
         if self.is_empty():
+            # 更新选中的 logits 的对应的 id
+            self.chosen_id = correct_ids_index_path[-1]
             return
         # 更新 logits 对验证失败的所有其他tokens 的路径进行剪枝
         # 获取验证的最后一个tensor 的 index, id 可能会重复，所以 要index才行

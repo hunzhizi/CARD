@@ -118,7 +118,7 @@ class DecodingModel(nn.Module):
                 position_ids=position_ids,
             )
             # 测试回滚效果
-            if len(tokens_id) == 4:
+            if len(tokens_id) == 3:
                 self._verified_update(tree, torch.tensor([3, 0, 0, 0], dtype=torch.int32, device='cuda'))
                 debug_queue.append(tokens_id.pop(0))
                 debug_queue.append(tokens_id.pop(0))
