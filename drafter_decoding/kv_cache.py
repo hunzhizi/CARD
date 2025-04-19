@@ -66,7 +66,8 @@ class KVCache:
         return torch.narrow(self.data, 2, 0, self.current_length)
 
 
-def initialize_past_key_values(model):
+def initialize_past_key_values(model,
+                               max_length: int = 4096):
     """
     Initialize past key and value states for a given transformer model.
 
@@ -104,7 +105,7 @@ def initialize_past_key_values(model):
                 startnum * 2,
                 batch_size,
                 config.num_key_value_heads,
-                config.max_position_embeddings,
+                max_length,
                 config.hidden_size // config.num_attention_heads,
                 device=startdevice,
                 dtype=model.dtype,
@@ -113,11 +114,12 @@ def initialize_past_key_values(model):
             startdevice = i
             startnum=0
         startnum += 1
+    print(f"The reserved context length is  {max_length}")
     past_key_values_data = torch.zeros(
         startnum * 2,
         batch_size,
         config.num_key_value_heads,
-        config.max_position_embeddings,
+        max_length,
         config.hidden_size // config.num_attention_heads,
         device=startdevice,
         dtype=model.dtype,
