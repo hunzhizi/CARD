@@ -28,8 +28,9 @@ class Tree:
 
         self.verified_pos_len = verified_pos_len
         # 最佳 candidate path
-        self.best_candidates = list()
+        self.best_candidates:list = list()
         self.chosen_id = -1  # 用于保存当cache全都被命中后的 logits 的选择，或者当被拒绝后重新选择的logits的 id
+        self.parent_id = 0 # 用于维护 update_for_target_model 中的 parent_id
 
     def set_device(self, device: torch.device):
         self.device = device
@@ -108,21 +109,20 @@ class Tree:
         self.kv_mask = torch.zeros([self.nodes_per_layer, 0], dtype=torch.int8, device=self.kv_mask.device)
         self.kv_cache_mask.fill_(0)
 
+        dequeue_num = correct_ids_index_path.size(0)
+        # 更新buffer
+        self.dequeue(dequeue_num)
+        # 更新 verified_pos_len
+        self.verified_pos_len += dequeue_num
         if is_reject is True:
-            dequeue_num = self.size
-            self.dequeue(dequeue_num)
-            self.chosen_id = -1
+            # 将 后面的 buffer 清零
+            self.head = self.tail
+            self.size = 0
             return
-        else:
-            dequeue_num = correct_ids_index_path.size(0)
-            # 更新buffer
-            self.dequeue(dequeue_num)
-            # 更新 verified_pos_len
-            self.verified_pos_len += dequeue_num
-        if self.is_empty():
-            # 更新选中的 logits 的对应的 id
-            self.chosen_id = correct_ids_index_path[-1]
-            return
+        # if self.is_empty():
+        #     # 更新选中的 logits 的对应的 id
+        #     self.chosen_id = correct_ids_index_path[-1]
+        #     return
         # 更新 logits 对验证失败的所有其他tokens 的路径进行剪枝
         # 获取验证的最后一个tensor 的 index, id 可能会重复，所以 要index才行
         parent_id = correct_ids_index_path[-1]
@@ -173,6 +173,27 @@ class Tree:
 
         return [picked_id.pop() for i in range(len(picked_id))], [picked_index.pop() for i in range(len(picked_index))]
 
-    def update(self, logits):
-        # 根据验证序列 来更新 buffer
-        pass
+    def update_for_target_model(self, combination_buffer: torch.Tensor):
+        '''
+        to maintain the tree for target model
+        Args:
+            combination_buffer: combination of received buffer
+
+        Returns:
+
+        '''
+        # 1. 做解包
+        # 2. 更新
+        # 维护最佳路径 目前使用贪心算法维护
+        offset = self.nodes_per_layer
+        self.logits_buffer[self.tail] = combination_buffer[:offset]
+        self.weight_buffer[self.tail] = combination_buffer[offset:2 * offset].to(torch.float64)
+        self.input_ids_buffer[self.tail] = combination_buffer[offset * 2: offset * 3].to(torch.int)
+        self.parents_index[self.tail] = combination_buffer[offset * 4 :].to(torch.int)
+        self.update_tail()
+        if len(self.best_candidates) == 0:
+            parent_id = 0
+            self.best_candidates.append()
+        else:
+            pass
+            # self.parents_index ==

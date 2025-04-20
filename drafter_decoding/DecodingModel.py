@@ -165,7 +165,8 @@ class DecodingModel(nn.Module):
                 tokens, index = tree.pick_path_for_test()
                 tensor1 = torch.tensor(index, device='cuda')
                 tensor2 = torch.tensor(len(index), device='cuda').unsqueeze(0)
-                buffer = torch.cat([tensor2, tensor1], dim=-1)
+                tensor3 = torch.tensor(0, device='cuda').unsqueeze(0)
+                buffer = torch.cat([tensor2, tensor3, tensor1], dim=-1)
                 outputs = self._verified_update(tree,
                                                 buffer,
                                                 outputs)
@@ -191,19 +192,17 @@ class DecodingModel(nn.Module):
                            correct_ids_index_path: torch.Tensor,
                            nodes_per_layer: int,
                            is_reject: bool = False) -> None:
+        # 这个位置被拒绝之后不一定长度为1
         start = self.verified_len
-        if is_reject:
-            self.current_length_data.fill_(start)
-            # 更新 verified_len
-            return
 
         tokens_len = correct_ids_index_path.size(0)
         indices = torch.arange(correct_ids_index_path.numel(), device=correct_ids_index_path.device,
                                dtype=correct_ids_index_path.dtype)
         indices = start + correct_ids_index_path + indices * nodes_per_layer
-        rest_kv = torch.arange(start + nodes_per_layer * tokens_len, self.past_key_values[0][0].shape[2],
-                               device=indices.device)
-        indices = torch.cat([indices, rest_kv], dim=0)
+        if not is_reject:
+            rest_kv = torch.arange(start + nodes_per_layer * tokens_len, self.past_key_values[0][0].shape[2],
+                                   device=indices.device)
+            indices = torch.cat([indices, rest_kv], dim=0)
         for data in self.past_key_values_data_list:
             tgt = data[..., indices.to(data.device), :]
             dst = data[..., start: start + indices.size(0), :]
@@ -218,13 +217,17 @@ class DecodingModel(nn.Module):
                          correct_ids_index_path: torch.Tensor,
                          outputs) -> torch.Tensor:
         # 规定 在 tensor 第一个位置为标志位
-        # 标志位 > 0:验证序列长度
-        # 标志位 == -1 ： 序列被拒绝
+        # 标志位 index[0] > 0:index[0]为验证序列长度
+        # 标志位 index[0]== -1 ： 序列被拒绝， 注意，当序列被拒绝不一定长度为1
+        # 标志位 index[1] 为 被拒绝后的 token_id
         length = int(correct_ids_index_path[0].item())
+        # 正确的 token ids  index 序列
+        correct_ids_index_path = correct_ids_index_path[2:length + 2]
+
         if length == -1:
             # 先回滚，然后携带正确 token 正常推理一次，更新树
-            self._rollback_kv_cache(correct_ids_index_path, tree.nodes_per_layer, is_reject=True)
-            input_id = correct_ids_index_path[-1].unsqueeze(0).unsqueeze(0)
+            self._rollback_kv_cache(correct_ids_index_path, tree.nodes_per_layer, is_reject=True) # todo 修改
+            input_id = correct_ids_index_path[1].unsqueeze(0).unsqueeze(0)
             outputs = self.model(
                 input_ids=input_id,
                 attention_mask=None,
@@ -232,12 +235,10 @@ class DecodingModel(nn.Module):
                 past_key_values=self.past_key_values,
                 position_ids=None,  # todo +1 or not?
             )
-            tree.verified_update(correct_ids_index_path, is_reject=True)
-            self.verified_len += 1
+            tree.verified_update(correct_ids_index_path, is_reject=True) # todo 修改
+            self.verified_len += correct_ids_index_path.size(0)
             return outputs
 
-        # 正确的 token ids  index 序列
-        correct_ids_index_path = correct_ids_index_path[1:length + 1]
 
         # 进行 kv——cache 回滚
         self._rollback_kv_cache(correct_ids_index_path, tree.nodes_per_layer)

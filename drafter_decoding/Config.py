@@ -1,2 +1,4 @@
 class Config:
     REJECTION_FLAG = -1
+    TARGET_MODEL_RANK = 1
+    DRAFTER_RANK = 0
