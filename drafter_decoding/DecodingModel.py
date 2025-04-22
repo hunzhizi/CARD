@@ -5,17 +5,24 @@ import torch
 from fastchat.data.split_long_conversation import max_length
 from numpy.ma.core import divide
 
+from .CacherManager import CacheManager
 from .Tree import Tree
 from .modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
 from drafter_decoding.kv_cache import initialize_past_key_values
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+
+
+def color_print(content: str, color_number: int = 4):
+    """print content with color. Some color numbers are listed: Gray: 0, Red: 1, Green: 2, Yellow: 3, Blue: 4."""
+    # if self.accelerator.is_main_process:
+    print(f"\033[9{color_number}m{content}\033[0m")
 
 
 class DecodingModel(nn.Module):
     def __init__(self,
                  model,
                  model_name_or_path,
-
+                 device:torch.device,
                  *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.model = model
@@ -23,8 +30,8 @@ class DecodingModel(nn.Module):
         self.vocab_size = model.lm_head.weight.shape[0]
         self.model_name_or_path = model_name_or_path
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path)
-        self.tree = None
         self.verified_len: int = 0
+        self.device = device
 
     def get_tokenizer(self):
         return self.tokenizer
@@ -32,15 +39,22 @@ class DecodingModel(nn.Module):
     @classmethod
     def from_pretrained(
             cls,
-            draft_model_path=None,
+            main_device: str,
+            draft_model_path = None,
+            target_model_path = None,
             **kwargs,
     ):
-
-        draft_model = KVLlamaForCausalLM.from_pretrained(
-            draft_model_path, **kwargs
-        )
+        # drafter using the customized model
+        if draft_model_path is not None:
+            model = KVLlamaForCausalLM.from_pretrained(
+                draft_model_path, **kwargs
+            ).eval()
+        # target model using the class from transformers lib on huggingface
+        elif target_model_path is not None:
+            model = AutoModelForCausalLM.from_pretrained(target_model_path,
+                                                         **kwargs).eval()
         # cls() 调用 MyClass 的 __init__ 方法创建了一个新实例
-        return cls(draft_model, draft_model_path)
+        return cls(model, draft_model_path, device=main_device)
 
     def process_tree_mask(self, tree_attention_mask, init_len):
         # todo 考虑封装到 Tree 中
@@ -96,18 +110,20 @@ class DecodingModel(nn.Module):
     # draft 是一个不断进行树状起草的函数，采用预先分配的kv cache 进行起草工作
     @torch.no_grad()
     def draft(self,
-              input_ids: int,
+              input_ids: torch.Tensor,
               nodes_per_layer: int = 20,
               max_depth: int = 50,
               ):
-        assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
+        assert input_ids.shape[0] == 1, "Only support batch size 1 for now!"
         # Avoid modifying the input_ids in-place
         input_ids = input_ids.clone()
         # Initialize the past key and value states
         if hasattr(self, "past_key_values"):
             past_key_values = self.past_key_values
-            past_key_values_data = self.past_key_values_data
+            past_key_values_data = self.past_key_values_data_list
             current_length_data = self.current_length_data
+            # Reset the past key and value states
+            current_length_data.zero_()
         else:
             (
                 past_key_values,
@@ -136,7 +152,7 @@ class DecodingModel(nn.Module):
         verified_len_posi = init_len - 1
 
         # 设置树所在的设备
-        tree = Tree(verified_len_posi, outputs[0].device, nodes_per_layer=5)
+        tree = Tree(verified_len_posi, outputs[0].device, nodes_per_layer=nodes_per_layer,max_depth=max_depth)
         # decode 阶段，在 decode 阶段，只要没有被完全拒绝，每一次都要处理一层的树节点。
         # 通过 Tree 类进行管理
         debug_queue = []
@@ -160,8 +176,7 @@ class DecodingModel(nn.Module):
                 position_ids=position_ids,
             )
             # 测试回滚效果
-            if tree.size >= 2:
-                print(f"token 被拒绝")
+            if tree.size >= 5:
                 tokens, index = tree.pick_path_for_test()
                 tensor1 = torch.tensor(index, device='cuda')
                 tensor2 = torch.tensor(len(index), device='cuda').unsqueeze(0)
@@ -187,6 +202,36 @@ class DecodingModel(nn.Module):
             print(f"the total len is {len(debug_queue)}")
             print(f"{j}..{(time.perf_counter() - start_time)}............")
             j += 1
+
+    @torch.no_grad()
+    def decoding_with_cache(self,
+                            input_ids: torch.Tensor,
+                            nodes_per_layer: int = 20,
+                            max_depth: int = 50):
+        '''
+        decoding with tree_cache for target model
+        Returns:
+
+        '''
+        assert input_ids.shape[0] == 1, "Only support batch size 1 for now!"
+        # create tree ,start recv cache
+        tree_buffer = Tree(input_ids.shape[1],self.device,nodes_per_layer,max_depth)
+        # todo init distributed env
+        cache_manager = CacheManager(self.world_size, self.rank,self.device,tree_buffer,is_target_model=True)
+        # prefill phase
+        # Initialize the past key and value states
+        if hasattr(self, "past_key_values"):
+            self.past_key_values = None
+            outputs = self.model(input_ids)
+            self.past_key_values = outputs.past_key_values
+        else:
+            outputs = self.model(input_ids)
+            self.past_key_values = outputs.past_key_values
+        # decode phase
+        # 1. query cache
+        cache_manager
+
+
 
     def _rollback_kv_cache(self,
                            correct_ids_index_path: torch.Tensor,
@@ -243,5 +288,8 @@ class DecodingModel(nn.Module):
         # 进行 kv——cache 回滚
         self._rollback_kv_cache(correct_ids_index_path, tree.nodes_per_layer)
         # 更新树
-        tree.verified_update(correct_ids_index_path)
+        is_having_zero_weight = tree.verified_update(correct_ids_index_path)
+        if is_having_zero_weight:
+            color_print("更新失败")
         return outputs
+

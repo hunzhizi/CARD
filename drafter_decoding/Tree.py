@@ -25,6 +25,7 @@ class Tree:
         self.head: int = 0
         self.tail: int = 0
         self.size: int = 0
+        self.pending_tail: int = 0 # 用于 在 verified_update 过程中 后续weight 更新为0 此时未命中，为了保证通信同步而设置的变量
 
         self.verified_pos_len = verified_pos_len
         # 最佳 candidate path
@@ -104,7 +105,7 @@ class Tree:
 
     def verified_update(self,
                         correct_ids_index_path: torch.Tensor,
-                        is_reject: bool = False):
+                        is_reject: bool = False) -> bool:
         # 更新 mask
         self.kv_mask = torch.zeros([self.nodes_per_layer, 0], dtype=torch.int8, device=self.kv_mask.device)
         self.kv_cache_mask.fill_(0)
@@ -115,10 +116,10 @@ class Tree:
         # 更新 verified_pos_len
         self.verified_pos_len += dequeue_num
         if is_reject is True:
-            # 将 后面的 buffer 清零
+            # 将后面的 buffer 清零
             self.head = self.tail
             self.size = 0
-            return
+            return False
         # if self.is_empty():
         #     # 更新选中的 logits 的对应的 id
         #     self.chosen_id = correct_ids_index_path[-1]
@@ -129,49 +130,80 @@ class Tree:
 
         index = self.head
         mask = torch.isin(self.parents_index[index], parent_id)
+        # 检查 mask 是否全为 0 if mask == 0 表明后续无正确 cache，需要回滚更新
+        if torch.sum(mask).item() == 0:
+            # todo
+            # self.pending_tail = index
+            # return True
+            print(f"更新失败")
         # 更新对应的weight 和 logits
         self.logits_buffer[index] *= mask
         self.weight_buffer[index] = self.logits_buffer[index].clone()
-        parent_id = self.input_ids_buffer[index][mask]
+        parent_id = torch.nonzero(mask).view(-1)
+        # parent_id = self.input_ids_buffer[index][mask]
         for i in range(1, self.size):
-            index = (i + self.head) % self.buffer_capacity  # todo index 循环求余
+            index = (i + self.head) % self.buffer_capacity
             mask = torch.isin(self.parents_index[index], parent_id)
+            if torch.sum(mask).item() == 0:
+                # self.pending_tail = index
+                # return True
+                print(f"更新失败")
             # 更新对应的weight 和 logits
             self.logits_buffer[index] *= mask
-            self.weight_buffer[index] = self.logits_buffer[index] * self.logits_buffer[
-                (index - 1) % self.buffer_capacity]
-            parent_id = self.input_ids_buffer[index][mask]
+            self.weight_buffer[index] = self.logits_buffer[index] * self.weight_buffer[ (index - 1) % self.buffer_capacity ]
+            parent_id = torch.nonzero(mask).view(-1)
+            # parent_id = self.input_ids_buffer[index][mask]
 
             # skip the first one
             parents = self.parents_index[index]
             self.kv_cache_mask[self.rows, parents] = 1
             self.kv_mask = torch.cat([self.kv_mask[parents], self.kv_cache_mask], dim=1)
+        return False
 
     def pick_path_for_test(self) -> Tuple[list, list]:
         # 随机选取接受的长度
         random_integer = torch.randint(1, self.size, (1,)).item()
         # 从后（tail）向前选择
-        picked_id = list()
+        # picked_id = list()
+        # picked_index = list()
+        # tail = (self.head + random_integer - 1) % self.buffer_capacity
+        # # 每次选择 概率最大的 index
+        # index = torch.argmax(self.logits_buffer[tail])
+        # # logits_buffer 有可能全0？ 所以推理可能有问题，正常target model 会返回一个以 torch.Tensor([-1, token_id])来通知草稿模型
+        # print(f"self.logits_buffer[tail] is {self.logits_buffer[tail]}")
+        # start_id = self.input_ids_buffer[tail][index].item()
+        # picked_id.append(start_id)
+        # picked_index.append(index)
+        # parent_id = self.parents_index[tail][index].item()
+        #
+        # for i, j in enumerate(range(random_integer - 1)):
+        #     tail -= 1
+        #     tail = tail % self.buffer_capacity
+        #     token = self.input_ids_buffer[tail][parent_id].item()
+        #     picked_id.append(token)
+        #     picked_index.append(parent_id)
+        #     parent_id = self.parents_index[tail][parent_id].item()
+
         picked_index = list()
-        tail = (self.head + random_integer - 1) % self.buffer_capacity
-        # 每次选择 概率最大的 index
-        index = torch.argmax(self.logits_buffer[tail])
-        # logits_buffer 有可能全0？ 所以推理可能有问题，正常target model 会返回一个以 torch.Tensor([-1, token_id])来通知草稿模型
-        print(f"self.logits_buffer[tail] is {self.logits_buffer[tail]}")
-        start_id = self.input_ids_buffer[tail][index].item()
-        picked_id.append(start_id)
-        picked_index.append(index)
-        parent_id = self.parents_index[tail][index].item()
-
-        for i, j in enumerate(range(random_integer - 1)):
-            tail -= 1
-            tail = tail % self.buffer_capacity
-            token = self.input_ids_buffer[tail][parent_id].item()
-            picked_id.append(token)
+        best_candidate = list()
+        head = self.head
+        weights = self.weight_buffer[head].clone()
+        for i in range(random_integer):
+            parent_id = torch.argmax(weights)
             picked_index.append(parent_id)
-            parent_id = self.parents_index[tail][parent_id].item()
+            best_candidate.append(self.input_ids_buffer[head][parent_id].item())
+            head += +1
+            head %= self.buffer_capacity
+            mask = torch.isin(self.parents_index[head], parent_id)
+            if torch.sum(mask).item() == 0:
+                print(f"选择路径失败")
+                break
+            weights = self.weight_buffer[head].clone()
+            weights*=mask
 
-        return [picked_id.pop() for i in range(len(picked_id))], [picked_index.pop() for i in range(len(picked_index))]
+        return best_candidate,picked_index
+
+        # return [picked_id.pop() for i in range(len(picked_id))], [picked_index.pop() for i in range(len(picked_index))]
 
     def update_for_target_model(self, combination_buffer: torch.Tensor):
         '''
@@ -184,16 +216,22 @@ class Tree:
         '''
         # 1. 做解包
         # 2. 更新
-        # 维护最佳路径 目前使用贪心算法维护
         offset = self.nodes_per_layer
         self.logits_buffer[self.tail] = combination_buffer[:offset]
         self.weight_buffer[self.tail] = combination_buffer[offset:2 * offset].to(torch.float64)
         self.input_ids_buffer[self.tail] = combination_buffer[offset * 2: offset * 3].to(torch.int)
         self.parents_index[self.tail] = combination_buffer[offset * 4 :].to(torch.int)
         self.update_tail()
-        if len(self.best_candidates) == 0:
-            parent_id = 0
-            self.best_candidates.append()
-        else:
-            pass
-            # self.parents_index ==
+
+
+
+    def get_candidates_for_target_model(self):
+        # todo 未完成
+        best_candidate = list()
+        # 从head 开始进行选取
+        # 更新完后检查 weight_buffer 是否为 0 ，在 verify 阶段检查？ 还是在这里进行检查？
+        # 在 verify 阶段检查 weight_buffer 全为0 的情况保证有效性
+        parent_id = torch.argmax(self.weight_buffer[self.head])
+        best_candidate.append(self.input_ids_buffer[parent_id])
+
+

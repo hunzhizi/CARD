@@ -13,7 +13,7 @@ class CacheManager:
                  world_size: int,
                  rank: int,
                  device,
-                 tree: Tree = None,
+                 tree: Tree ,
                  is_drafter: bool = False,
                  is_calibration: bool = False,
                  is_target_model: bool = False):
@@ -66,19 +66,27 @@ class CacheManager:
                 pass
             pass
             return None
-        if self.is_calibration:
+        elif self.is_calibration:
             pass
-        if self.is_target_model:
+        elif self.is_target_model:
             # 目标模型需要
             # 1. 接收 每一层的树
             # 2. 做解包
             # 3. 更新
             if self.world_size == 2:
-                def recv_buffer():
+                def recv_method():
                     buffer_combination = torch.zeros(self.nodes_per_layer * 4, dtype=torch.float32, device=self.device)
                     while True:
                         dist.recv(tensor=buffer_combination, src=Config.DRAFTER_RANK)
-                        buffer_combination
+                        # 接收信息之后放入 tree_buffer 中
+                        self.tree_buffer.update_for_target_model(buffer_combination)
+
+                thread = threading.Thread(
+                    target=recv_method,
+                )
+                thread.daemon = True
+                thread.start()
+                thread.join()
 
             elif self.world_size == 3:
                 pass

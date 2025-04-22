@@ -10,6 +10,7 @@ draft_model_path = "/mnt/data/zhouShaoRepo/model/llama-68m"
 
 model = DecodingModel.from_pretrained(
     draft_model_path=base_model_path,
+    main_device='cuda',
     torch_dtype=torch.float16,
     low_cpu_mem_usage=True,
     device_map="auto"
@@ -20,7 +21,7 @@ your_message="Hello, tell me a story about a man who lost his way in the forest 
 
 input_ids=model.tokenizer([your_message]).input_ids
 input_ids = torch.as_tensor(input_ids).cuda()
-output_ids=model.draft(input_ids,nodes_per_layer=50)
+output_ids=model.draft(input_ids,nodes_per_layer=20)
 # output_ids=model.autogressive_decoding(input_ids)
 output=model.tokenizer.decode(output_ids[0])
 
