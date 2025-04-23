@@ -18,6 +18,7 @@ model = DecodingModel.from_pretrained(
 model.eval()
 
 your_message="Hello, tell me a story about a man who lost his way in the forest and found a treasure."
+# your_message="tell me a story about little bear."
 
 input_ids=model.tokenizer([your_message]).input_ids
 input_ids = torch.as_tensor(input_ids).cuda()

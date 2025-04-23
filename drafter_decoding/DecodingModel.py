@@ -1,4 +1,5 @@
 import time
+from typing import Tuple
 
 import torch.nn as nn
 import torch
@@ -22,7 +23,7 @@ class DecodingModel(nn.Module):
     def __init__(self,
                  model,
                  model_name_or_path,
-                 device:torch.device,
+                 device: torch.device,
                  *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.model = model
@@ -40,8 +41,8 @@ class DecodingModel(nn.Module):
     def from_pretrained(
             cls,
             main_device: str,
-            draft_model_path = None,
-            target_model_path = None,
+            draft_model_path=None,
+            target_model_path=None,
             **kwargs,
     ):
         # drafter using the customized model
@@ -152,7 +153,7 @@ class DecodingModel(nn.Module):
         verified_len_posi = init_len - 1
 
         # 设置树所在的设备
-        tree = Tree(verified_len_posi, outputs[0].device, nodes_per_layer=nodes_per_layer,max_depth=max_depth)
+        tree = Tree(verified_len_posi, outputs[0].device, nodes_per_layer=nodes_per_layer, max_depth=max_depth)
         # decode 阶段，在 decode 阶段，只要没有被完全拒绝，每一次都要处理一层的树节点。
         # 通过 Tree 类进行管理
         debug_queue = []
@@ -160,7 +161,6 @@ class DecodingModel(nn.Module):
         input_ids, position_ids, tree_attention_mask, parents = tree.enqueue(
             torch.softmax(outputs[0], dim=-1, dtype=torch.float32))
         tree_attention_mask = self.process_tree_mask(tree_attention_mask, init_len)
-        print(self.tokenizer.decode(input_ids[0]))
         # drafter decoding
         j = 0
         start_time = time.perf_counter()
@@ -176,7 +176,7 @@ class DecodingModel(nn.Module):
                 position_ids=position_ids,
             )
             # 测试回滚效果
-            if tree.size >= 5:
+            if tree.size >= 20:
                 tokens, index = tree.pick_path_for_test()
                 tensor1 = torch.tensor(index, device='cuda')
                 tensor2 = torch.tensor(len(index), device='cuda').unsqueeze(0)
@@ -199,6 +199,7 @@ class DecodingModel(nn.Module):
             # candidates_id.append(input_ids[0][1].item())
             # print(self.tokenizer.decode(input_ids[0]))
             print(f"the best candidates are \n{self.tokenizer.decode(debug_queue)}")
+            # print(f"the token_ids are {debug_queue}")
             print(f"the total len is {len(debug_queue)}")
             print(f"{j}..{(time.perf_counter() - start_time)}............")
             j += 1
@@ -215,9 +216,9 @@ class DecodingModel(nn.Module):
         '''
         assert input_ids.shape[0] == 1, "Only support batch size 1 for now!"
         # create tree ,start recv cache
-        tree_buffer = Tree(input_ids.shape[1],self.device,nodes_per_layer,max_depth)
+        tree_buffer = Tree(input_ids.shape[1], self.device, nodes_per_layer, max_depth)
         # todo init distributed env
-        cache_manager = CacheManager(self.world_size, self.rank,self.device,tree_buffer,is_target_model=True)
+        cache_manager = CacheManager(self.world_size, self.rank, self.device, tree_buffer, is_target_model=True)
         # prefill phase
         # Initialize the past key and value states
         if hasattr(self, "past_key_values"):
@@ -230,8 +231,6 @@ class DecodingModel(nn.Module):
         # decode phase
         # 1. query cache
         cache_manager
-
-
 
     def _rollback_kv_cache(self,
                            correct_ids_index_path: torch.Tensor,
@@ -256,6 +255,9 @@ class DecodingModel(nn.Module):
         # 更新 verified_len
         self.verified_len += tokens_len
 
+    def _kv_cache_truncate(self, cache_len: int):
+        self.current_length_data.fill_(cache_len)
+
     # 传入正确的 路径，更新树并 进行 kv-cache的回滚
     # 由目标模型传过来的正确的更新序列
     def _verified_update(self, tree: Tree,
@@ -271,25 +273,39 @@ class DecodingModel(nn.Module):
 
         if length == -1:
             # 先回滚，然后携带正确 token 正常推理一次，更新树
-            self._rollback_kv_cache(correct_ids_index_path, tree.nodes_per_layer, is_reject=True) # todo 修改
+            self._rollback_kv_cache(correct_ids_index_path, tree.nodes_per_layer, is_reject=True)
             input_id = correct_ids_index_path[1].unsqueeze(0).unsqueeze(0)
             outputs = self.model(
                 input_ids=input_id,
                 attention_mask=None,
                 tree_attention_mask=None,
                 past_key_values=self.past_key_values,
-                position_ids=None,  # todo +1 or not?
+                position_ids=None,
             )
-            tree.verified_update(correct_ids_index_path, is_reject=True) # todo 修改
+            tree.verified_update(correct_ids_index_path, is_reject=True)
             self.verified_len += correct_ids_index_path.size(0)
             return outputs
-
 
         # 进行 kv——cache 回滚
         self._rollback_kv_cache(correct_ids_index_path, tree.nodes_per_layer)
         # 更新树
         is_having_zero_weight = tree.verified_update(correct_ids_index_path)
-        if is_having_zero_weight:
-            color_print("更新失败")
-        return outputs
+        if is_having_zero_weight is not None:
+            parent_id = is_having_zero_weight
+            # 1. kv-cache truncated
+            length = self.verified_len + tree.nodes_per_layer * tree.size
+            self._kv_cache_truncate(length)
+            # 2. enqueue using level_2_cache
+            input_ids, position_ids, tree_attention_mask, parents = tree.enqueue_using_level2cache(parent_id)
+            tree_attention_mask = self.process_tree_mask(tree_attention_mask, self.verified_len)
+            outputs = self.model(
+                input_ids=input_ids,
+                tree_attention_mask=tree_attention_mask,
+                past_key_values=self.past_key_values,
+                position_ids=position_ids,
+            )
+            # 3. send message
+            # 4. decode once and get output
 
+            color_print("divergence")
+        return outputs

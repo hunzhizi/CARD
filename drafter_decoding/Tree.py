@@ -1,3 +1,4 @@
+from operator import index
 from typing import Tuple
 
 import torch
@@ -26,6 +27,9 @@ class Tree:
         self.tail: int = 0
         self.size: int = 0
         self.pending_tail: int = 0 # 用于 在 verified_update 过程中 后续weight 更新为0 此时未命中，为了保证通信同步而设置的变量
+        # level-2 cache for updating buffer when weight is all zero
+        self.level2cache_input_ids: torch.Tensor = torch.zeros([max_depth,nodes_per_layer,nodes_per_layer], device=device)
+        self.level2cache_logits: torch.Tensor = torch.zeros([max_depth,nodes_per_layer,nodes_per_layer], device=device)
 
         self.verified_pos_len = verified_pos_len
         # 最佳 candidate path
@@ -67,6 +71,9 @@ class Tree:
         else:
             # 获取一层中的 每一个节点的logits
             logits, ids = torch.topk(logits[0], k=self.nodes_per_layer, dim=-1)
+            # 注意存放的位置是在当前layer 去找，不是上一层。
+            self.level2cache_logits[self.tail] = logits
+            self.level2cache_input_ids[self.tail] = ids
             orig_logits = logits
             last_layer_weights = self.weight_buffer[self.tail - 1].unsqueeze(1)
             logits = logits * last_layer_weights
@@ -83,6 +90,7 @@ class Tree:
             self.input_ids_buffer[self.tail].copy_(input_ids)
             self.parents_index[self.tail].copy_(parents)
             # 制作上一次推理的 kv cache
+            self.kv_cache_mask.zero_()
             self.kv_cache_mask[self.rows, parents] = 1
             # 根据parents 找到前面所有kv_mask 对应的tensor，与本次新形成的kv_cache_mask 进行拼接。
             # 最后与对角阵拼接，获得当前推理的掩码
@@ -103,12 +111,57 @@ class Tree:
         self.head = (self.head + dequeue_num) % self.buffer_capacity
         self.size -= dequeue_num
 
+
+    def enqueue_using_level2cache(self,parent_id):
+        # index = (self.tail - 1) % self.buffer_capacity
+        index = self.tail
+        # make a mask
+        mask = torch.zeros(self.nodes_per_layer,device=self.device)
+        mask[parent_id] = True
+        mask = mask.unsqueeze(1)
+        flat_ids = (self.level2cache_input_ids[index] * mask).to(torch.int).view(-1)
+        flat_logits = (self.level2cache_logits[index] * mask) .view(-1)
+        global_top_logits, global_top_idx = torch.topk(flat_logits, k=self.nodes_per_layer, dim=-1)
+        input_ids = flat_ids[global_top_idx]
+        parents = global_top_idx // self.nodes_per_layer
+        logits = flat_logits[global_top_idx]
+        self.logits_buffer[self.tail].copy_(logits)
+        self.weight_buffer[self.tail].copy_(global_top_logits)
+        self.input_ids_buffer[self.tail].copy_(input_ids)
+        self.parents_index[self.tail].copy_(parents)
+        if self.is_empty():
+            self.update_tail()
+            return (input_ids.unsqueeze(0),
+                    self.position_id + 1 + self.verified_pos_len,
+                    self.tri,
+                    self.rows)
+
+        # 制作上一次推理的 kv cache
+        self.kv_cache_mask.zero_()
+        self.kv_cache_mask[self.rows, parents] = 1
+        # 根据parents 找到前面所有kv_mask 对应的tensor，与本次新形成的kv_cache_mask 进行拼接。
+        # 最后与对角阵拼接，获得当前推理的掩码
+        self.kv_mask = torch.cat([self.kv_mask[parents], self.kv_cache_mask], dim=1)
+        attention_mask = torch.cat([self.kv_mask, self.tri], dim=1)
+        # print(f"weight_buffer is {self.weight_buffer[self.tail]}")
+        self.update_tail()
+
+        return (input_ids.unsqueeze(0),
+                self.position_id + (self.size + 1) + self.verified_pos_len,
+                attention_mask,
+                parents)
+
+    def truncate_path(self, index: int):
+        self.tail = index
+        self.size = (self.tail - self.head )% self.buffer_capacity
+        self.pending_tail = index
+
     def verified_update(self,
                         correct_ids_index_path: torch.Tensor,
-                        is_reject: bool = False) -> bool:
+                        is_reject: bool = False) -> torch.Tensor | None:
         # 更新 mask
         self.kv_mask = torch.zeros([self.nodes_per_layer, 0], dtype=torch.int8, device=self.kv_mask.device)
-        self.kv_cache_mask.fill_(0)
+        # self.kv_cache_mask.fill_(0)
 
         dequeue_num = correct_ids_index_path.size(0)
         # 更新buffer
@@ -133,56 +186,34 @@ class Tree:
         # 检查 mask 是否全为 0 if mask == 0 表明后续无正确 cache，需要回滚更新
         if torch.sum(mask).item() == 0:
             # todo
-            # self.pending_tail = index
-            # return True
+            self.truncate_path(index)
             print(f"更新失败")
+            return parent_id
         # 更新对应的weight 和 logits
         self.logits_buffer[index] *= mask
         self.weight_buffer[index] = self.logits_buffer[index].clone()
         parent_id = torch.nonzero(mask).view(-1)
-        # parent_id = self.input_ids_buffer[index][mask]
         for i in range(1, self.size):
             index = (i + self.head) % self.buffer_capacity
             mask = torch.isin(self.parents_index[index], parent_id)
             if torch.sum(mask).item() == 0:
-                # self.pending_tail = index
-                # return True
+                self.truncate_path(index)
                 print(f"更新失败")
+                return parent_id
             # 更新对应的weight 和 logits
-            self.logits_buffer[index] *= mask
-            self.weight_buffer[index] = self.logits_buffer[index] * self.weight_buffer[ (index - 1) % self.buffer_capacity ]
+            self.weight_buffer[index] = self.weight_buffer[(index - 1) % self.buffer_capacity][self.parents_index[index]] * self.logits_buffer[index]
             parent_id = torch.nonzero(mask).view(-1)
-            # parent_id = self.input_ids_buffer[index][mask]
 
             # skip the first one
             parents = self.parents_index[index]
+            self.kv_cache_mask.zero_()
             self.kv_cache_mask[self.rows, parents] = 1
             self.kv_mask = torch.cat([self.kv_mask[parents], self.kv_cache_mask], dim=1)
-        return False
+        return None
 
     def pick_path_for_test(self) -> Tuple[list, list]:
         # 随机选取接受的长度
         random_integer = torch.randint(1, self.size, (1,)).item()
-        # 从后（tail）向前选择
-        # picked_id = list()
-        # picked_index = list()
-        # tail = (self.head + random_integer - 1) % self.buffer_capacity
-        # # 每次选择 概率最大的 index
-        # index = torch.argmax(self.logits_buffer[tail])
-        # # logits_buffer 有可能全0？ 所以推理可能有问题，正常target model 会返回一个以 torch.Tensor([-1, token_id])来通知草稿模型
-        # print(f"self.logits_buffer[tail] is {self.logits_buffer[tail]}")
-        # start_id = self.input_ids_buffer[tail][index].item()
-        # picked_id.append(start_id)
-        # picked_index.append(index)
-        # parent_id = self.parents_index[tail][index].item()
-        #
-        # for i, j in enumerate(range(random_integer - 1)):
-        #     tail -= 1
-        #     tail = tail % self.buffer_capacity
-        #     token = self.input_ids_buffer[tail][parent_id].item()
-        #     picked_id.append(token)
-        #     picked_index.append(parent_id)
-        #     parent_id = self.parents_index[tail][parent_id].item()
 
         picked_index = list()
         best_candidate = list()
@@ -200,6 +231,8 @@ class Tree:
                 break
             weights = self.weight_buffer[head].clone()
             weights*=mask
+            if torch.sum(weights).item() == 0:
+                break
 
         return best_candidate,picked_index
 
