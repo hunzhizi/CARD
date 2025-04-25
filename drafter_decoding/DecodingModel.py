@@ -3,14 +3,16 @@ from typing import Tuple
 
 import torch.nn as nn
 import torch
-from fastchat.data.split_long_conversation import max_length
-from numpy.ma.core import divide
-
 from .CacherManager import CacheManager
+from .Config import Config
+from .KVCacheModel import KVCacheModel
 from .Tree import Tree
 from .modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
 from drafter_decoding.kv_cache import initialize_past_key_values
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+import torch.distributed as dist
+
+from .util import seed_everything
 
 
 def color_print(content: str, color_number: int = 4):
@@ -24,15 +26,112 @@ class DecodingModel(nn.Module):
                  model,
                  model_name_or_path,
                  device: torch.device,
+                 parser_args = None,
                  *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if parser_args is not None:
+            seed_everything(parser_args.seed)
+            self.parser_args = parser_args
+            self.seed = parser_args.seed
+
+            # 从 args 中获取分布式参数
+            self.rank = parser_args.rank  # 当前进程的全局排名
+            self.world_size = parser_args.world_size  # 总进程数
+            self.local_rank = parser_args.local_rank  # 本地设备上的排名（如单机多卡时为 GPU ID）
+
+            self.is_drafter: bool = False
+            self.is_target_model = False
+            self.cuda_device_count: int = torch.cuda.device_count()
+            dist.init_process_group(
+                backend='nccl',  # 如果是纯 CPU 用 'gloo'，GPU 建议 'nccl'
+                init_method='tcp://127.0.0.1:12345',  # 或者从 args 传入
+                rank=self.rank,
+                world_size=self.world_size
+            )
+            self.eval_mode = parser_args.eval_mode
+            if parser_args.eval_mode == "two_model":
+                self._init_two_model_config()
+            elif parser_args.eval_mode == "three_model":
+                pass
+            elif parser_args.eval_mode == "single_model":
+                # self._init_single_model_config()
+                pass
+            # load_model
+            self._load_model()
+            # self.inference_data = InferenceData(self.rank)
+            self.hidden_size = self.model.lm_head.weight.shape[-1]
+            self.vocab_size = self.model.lm_head.weight.shape[0]
+            self.tokenizer = AutoTokenizer.from_pretrained(self.parser_args.target_model_dir)
+            self.model_name = parser_args.model_name
+            self.max_tokens = parser_args.max_tokens
+            self.temperature = parser_args.temperature
+            self.top_k = parser_args.top_k
+            self.top_p = parser_args.top_p
+            self.branch_prediction_num = parser_args.branch_prediction_num
+            self.drafters_num = len(parser_args.draft_models_dir)
+            self.target_model_rank_num = self.drafters_num
+            self.dataset_name = ""
+            self.verified_len: int = 0
+
+            return
         self.model = model
         self.hidden_size = model.lm_head.weight.shape[-1]
         self.vocab_size = model.lm_head.weight.shape[0]
         self.model_name_or_path = model_name_or_path
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path)
         self.verified_len: int = 0
-        self.device = device
+
+    def _init_two_model_config(self) -> None:
+        color_print(f"初始化", self.rank)
+        if self.local_rank == 0 and torch.cuda.is_available():
+            torch.cuda.set_device(self.local_rank)
+            self.device = torch.device(f"cuda:{self.local_rank}")
+            self.is_drafter = True
+        elif self.local_rank == 1 and torch.cuda.is_available():
+            torch.cuda.set_device(self.local_rank)
+            self.device = torch.device(f"cuda:{self.local_rank}")
+            self.is_target_model = True
+
+
+    def _load_model(self):
+        if self.eval_mode == "two_model":
+            print(f"进程 {self.local_rank} 的本地设备: {self.device}")
+            # 所有模型仅用于推理，禁用梯度
+            torch.set_grad_enabled(False)
+            if self.is_drafter:
+                color_print(f"{self.device} Loading models:{self.parser_args.draft_models_dir[self.local_rank]}\n",
+                                 self.rank)
+                # Draft 模型：严格绑定到当前设备
+                # caution drafter should use KVLlamaForCausalLM as the model
+                self.model = KVLlamaForCausalLM.from_pretrained(
+                    self.parser_args.draft_models_dir[self.local_rank],
+                    device_map={"": self.device},  # 显式指定GPU索引
+                    torch_dtype=torch.bfloat16,
+                    trust_remote_code=True
+                ).eval()
+            if self.is_target_model:
+                config = AutoConfig.from_pretrained(self.parser_args.target_model_dir)
+                device_map = {"": self.device}
+                if self.cuda_device_count == 3:
+                    num_layers = config.num_hidden_layers
+                    split_point = num_layers // 2 + 1
+                    device_map = {
+                        "model.embed_tokens": "cuda:1",
+                        **{f"model.layers.{i}": "cuda:1" for i in range(0, split_point)},
+                        **{f"model.layers.{i}": "cuda:2" for i in range(split_point, num_layers)},
+                        "model.norm": "cuda:2",
+                        "model.rotary_emb": "cuda:2",
+                        "lm_head": "cuda:2",
+                    }
+                print(device_map)
+                color_print(f"Loading models:{self.parser_args.target_model_dir}\n", self.rank)
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.parser_args.target_model_dir,
+                    device_map=device_map,
+                    torch_dtype=torch.bfloat16,
+                    trust_remote_code=True,
+                ).eval()
+                # print(self.model)
 
     def get_tokenizer(self):
         return self.tokenizer
@@ -110,11 +209,11 @@ class DecodingModel(nn.Module):
 
     # draft 是一个不断进行树状起草的函数，采用预先分配的kv cache 进行起草工作
     @torch.no_grad()
-    def draft(self,
-              input_ids: torch.Tensor,
-              nodes_per_layer: int = 20,
-              max_depth: int = 50,
-              ):
+    def draft_single_card_test(self,
+                               input_ids: torch.Tensor,
+                               nodes_per_layer: int = 20,
+                               max_depth: int = 50,
+                               ):
         assert input_ids.shape[0] == 1, "Only support batch size 1 for now!"
         # Avoid modifying the input_ids in-place
         input_ids = input_ids.clone()
@@ -154,6 +253,7 @@ class DecodingModel(nn.Module):
 
         # 设置树所在的设备
         tree = Tree(verified_len_posi, outputs[0].device, nodes_per_layer=nodes_per_layer, max_depth=max_depth)
+        # cache_manager = CacheManager(world_size=self.world_size,rank=self.rank,device=tree.device,tree=tree,is_drafter=True)
         # decode 阶段，在 decode 阶段，只要没有被完全拒绝，每一次都要处理一层的树节点。
         # 通过 Tree 类进行管理
         debug_queue = []
@@ -199,10 +299,93 @@ class DecodingModel(nn.Module):
             # candidates_id.append(input_ids[0][1].item())
             # print(self.tokenizer.decode(input_ids[0]))
             print(f"the best candidates are \n{self.tokenizer.decode(debug_queue)}")
-            # print(f"the token_ids are {debug_queue}")
+            print(f"the token_ids are {debug_queue}")
             print(f"the total len is {len(debug_queue)}")
             print(f"{j}..{(time.perf_counter() - start_time)}............")
             j += 1
+
+    # draft 是一个不断进行树状起草的函数，采用预先分配的kv cache 进行起草工作
+    @torch.no_grad()
+    def draft(self,
+              input_ids: torch.Tensor,
+              nodes_per_layer: int = 20,
+              max_depth: int = 50,
+              ):
+        assert input_ids.shape[0] == 1, "Only support batch size 1 for now!"
+        # Avoid modifying the input_ids in-place
+        input_ids = input_ids.clone()
+        # Initialize the past key and value states
+        if hasattr(self, "past_key_values"):
+            past_key_values = self.past_key_values
+            past_key_values_data = self.past_key_values_data_list
+            current_length_data = self.current_length_data
+            # Reset the past key and value states
+            current_length_data.zero_()
+        else:
+            (
+                past_key_values,
+                past_key_values_data,
+                current_length_data,
+            ) = initialize_past_key_values(self.model)
+            self.past_key_values = past_key_values
+            self.past_key_values_data_list = past_key_values_data
+            self.current_length_data = current_length_data
+
+        input_len = input_ids.shape[1]
+        tree_attention_mask = None
+        print(self.tokenizer.decode(input_ids[0]))
+
+        # prefill 阶段
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=None,
+            tree_attention_mask=tree_attention_mask,
+            past_key_values=past_key_values,
+            position_ids=None,
+        )
+        # init_len用于制作掩码
+        init_len = input_ids.shape[1]
+        self.verified_len = init_len
+        verified_len_posi = init_len - 1
+
+        # 设置树所在的设备
+        tree = Tree(verified_len_posi, outputs[0].device, nodes_per_layer=nodes_per_layer, max_depth=max_depth)
+        cache_manager = CacheManager(world_size=self.world_size,rank=self.rank,device=tree.device,tree=tree,is_drafter=True)
+        # decode 阶段，在 decode 阶段，只要没有被完全拒绝，每一次都要处理一层的树节点。
+        # 通过 Tree 类进行管理
+        input_ids, position_ids, tree_attention_mask, parents = tree.enqueue(
+            torch.softmax(outputs[0], dim=-1, dtype=torch.float32))
+        work = dist.isend(tree.get_send_msg_for_drafter(), dst=Config.TARGET_MODEL_RANK)
+        tree_attention_mask = self.process_tree_mask(tree_attention_mask, init_len)
+        # drafter decoding
+        while True:
+            # if self.tokenizer.eos_token_id == input_ids:
+            #     break
+            # input_ids = input_ids.unsqueeze(0).unsqueeze(0)
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=None,
+                tree_attention_mask=tree_attention_mask,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+            )
+
+
+            if cache_manager.is_update:
+                # we need to update the tree buffer
+                outputs = self._verified_update(tree,cache_manager.recv_buffer,outputs)
+                cache_manager.is_update = False
+
+            # outputs[0]： 表示的是 logits
+            # 第一次推理节点的维度为 size(1,23,32000)
+            # size(batch_size, seq_len, vocab_size)
+            # 可以根据 seq_len 来判断当前处理情况是一层树，还是只是正常推理
+            input_ids, position_ids, tree_attention_mask, parents = tree.enqueue(
+                torch.softmax(outputs[0], dim=-1, dtype=torch.float32))
+            work = dist.isend(tree.get_send_msg_for_drafter(),dst=Config.TARGET_MODEL_RANK)
+            tree_attention_mask = self.process_tree_mask(tree_attention_mask, self.verified_len)
+            color_print(f"input_ids are {input_ids}", self.rank)
+
 
     @torch.no_grad()
     def decoding_with_cache(self,
@@ -215,22 +398,68 @@ class DecodingModel(nn.Module):
 
         '''
         assert input_ids.shape[0] == 1, "Only support batch size 1 for now!"
+        self.verified_len = input_ids.shape[1]
         # create tree ,start recv cache
         tree_buffer = Tree(input_ids.shape[1], self.device, nodes_per_layer, max_depth)
         # todo init distributed env
+
         cache_manager = CacheManager(self.world_size, self.rank, self.device, tree_buffer, is_target_model=True)
-        # prefill phase
+        color_print(f"执行")
+
+        # prefill phase merged into decoding phase
+        model = KVCacheModel(self.model, init_input_len=input_ids.shape[1])
         # Initialize the past key and value states
-        if hasattr(self, "past_key_values"):
-            self.past_key_values = None
-            outputs = self.model(input_ids)
-            self.past_key_values = outputs.past_key_values
-        else:
-            outputs = self.model(input_ids)
-            self.past_key_values = outputs.past_key_values
+        # input_ids = model.generate(input_ids)
         # decode phase
-        # 1. query cache
-        cache_manager
+        output_token_ids = input_ids.clone()
+        while True:
+            # 1. query cache
+            best_candidates, picked_index, root_index = cache_manager.query_cache()
+            best_candidates = torch.tensor(best_candidates, device=self.device, dtype=torch.int).unsqueeze(0)
+            # 2. decode with cache
+            if model._past_key_values is None:
+                best_candidates = torch.cat([input_ids, best_candidates], dim=-1)
+            token_ids = model.generate(best_candidates)
+            # [debug]
+            color_print(f"target model token_ids are {token_ids}",self.rank)
+            # 1d token_ids
+            # 保存输出
+            output_token_ids = torch.cat([output_token_ids, token_ids.unsqueeze(0)], dim=-1)
+            # tokens_ids is 1-d tensor
+            # 3. check if all verified tokens in cache
+            # let me clear: what is accept and reject?
+            # as long as all the tokens_ids are in tree_buffer, that means accept .the other will be rejection
+            # 3.1 update tree buffer
+            correct_ids_index_path = picked_index[:token_ids.shape[0] - 1]
+            new_sample_token = token_ids[-1]
+            hit_cache = cache_manager.update_tree_buffer(correct_ids_index_path, new_sample_token,
+                                                         root_index=root_index)
+            # hit_cache 如果不为 false 则其为 一个 tensor 里面表示 new_token_idx
+            if hit_cache:
+                # 命中cache
+                #   3.1 acc (could find a path in cache)
+                seq_len = torch.tensor(token_ids.shape[0], device=self.device) + 1
+                pad = torch.tensor(0, device=self.device)
+                send_msg = torch.cat([seq_len, pad, token_ids, hit_cache], dim=-1)
+            else:
+                # 未命中，发送格式
+                # index[0] = -1 序列被拒绝
+                # index[1] 被拒绝后的token
+                #   3.2 reject  (could not find a path in cache)
+                seq_len = torch.tensor(token_ids.shape[0], device=self.device) + 1
+                send_msg = torch.cat([seq_len, new_sample_token, token_ids], dim=-1)
+
+            # 4. isend message including index info to drafter
+            work = dist.isend(send_msg, dst=Config.TARGET_MODEL_RANK)
+            # currently send a 1-d tensor todo to align the dim with the receiver
+
+            # 5.  rollback kv_cache
+            model.rollback(output_token_ids.shape[1])
+
+            # 6. wait()
+            work.wait()
+            tree_buffer.tail = tree_buffer.pending_tail
+            tree_buffer.size = (tree_buffer.tail - tree_buffer.head) % tree_buffer.buffer_capacity
 
     def _rollback_kv_cache(self,
                            correct_ids_index_path: torch.Tensor,
@@ -297,6 +526,9 @@ class DecodingModel(nn.Module):
             self._kv_cache_truncate(length)
             # 2. enqueue using level_2_cache
             input_ids, position_ids, tree_attention_mask, parents = tree.enqueue_using_level2cache(parent_id)
+            # 3. send message
+            work = dist.isend(tree.get_send_msg_for_drafter(),dst=Config.TARGET_MODEL_RANK)
+            # 4. decode once and get output
             tree_attention_mask = self.process_tree_mask(tree_attention_mask, self.verified_len)
             outputs = self.model(
                 input_ids=input_ids,
@@ -304,8 +536,7 @@ class DecodingModel(nn.Module):
                 past_key_values=self.past_key_values,
                 position_ids=position_ids,
             )
-            # 3. send message
-            # 4. decode once and get output
+
 
             color_print("divergence")
         return outputs

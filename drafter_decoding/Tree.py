@@ -238,9 +238,9 @@ class Tree:
 
         # return [picked_id.pop() for i in range(len(picked_id))], [picked_index.pop() for i in range(len(picked_index))]
 
-    def update_for_target_model(self, combination_buffer: torch.Tensor):
+    def update_cache_for_target_model(self, combination_buffer: torch.Tensor):
         '''
-        to maintain the tree for target model
+        to maintain the tree cache for target model
         Args:
             combination_buffer: combination of received buffer
 
@@ -253,18 +253,109 @@ class Tree:
         self.logits_buffer[self.tail] = combination_buffer[:offset]
         self.weight_buffer[self.tail] = combination_buffer[offset:2 * offset].to(torch.float64)
         self.input_ids_buffer[self.tail] = combination_buffer[offset * 2: offset * 3].to(torch.int)
-        self.parents_index[self.tail] = combination_buffer[offset * 4 :].to(torch.int)
+        self.parents_index[self.tail] = combination_buffer[offset * 3 :].to(torch.int)
         self.update_tail()
 
 
+    def get_send_msg_for_drafter(self) -> torch.Tensor:
+        '''
+        after enqueue ,we need to send msg to target model to notice the target model
+        Returns:
+            torch.Tensor combination_buffer of send msg
+        '''
+        index = (self.tail - 1) % self.buffer_capacity
+        combination_buffer = torch.cat([self.logits_buffer[index],
+                    self.weight_buffer[index],
+                    self.input_ids_buffer[index],
+                    self.parents_index[index]],dim=-1)
+        return combination_buffer
 
-    def get_candidates_for_target_model(self):
-        # todo 未完成
-        best_candidate = list()
+
+
+    def get_candidates_for_target_model(self) -> Tuple[list,list,int]:
+        # todo 未测试
         # 从head 开始进行选取
         # 更新完后检查 weight_buffer 是否为 0 ，在 verify 阶段检查？ 还是在这里进行检查？
         # 在 verify 阶段检查 weight_buffer 全为0 的情况保证有效性
-        parent_id = torch.argmax(self.weight_buffer[self.head])
-        best_candidate.append(self.input_ids_buffer[parent_id])
+        # 在这里只做健壮性检查用于调试，在更新过程中会通知，如果更新到某一层的 weight_buffer 全为0 的情况
+        picked_index = list()
+        best_candidate = list()
+        head = self.head
+        weights = self.weight_buffer[head].clone()
+        parent_id = torch.argmax(weights)
+        root_index = self.parents_index[parent_id]
+        for i in range(self.size):
+            # greedy choose cache tokens
+            parent_id = torch.argmax(weights)
+            picked_index.append(parent_id)
+            best_candidate.append(self.input_ids_buffer[head][parent_id].item())
+            head += +1
+            head %= self.buffer_capacity
+            mask = torch.isin(self.parents_index[head], parent_id)
+            if torch.sum(mask).item() == 0:
+                print(f"选择路径失败")
+                break
+            weights = self.weight_buffer[head].clone()
+            weights *= mask
+
+        return best_candidate,picked_index,root_index
 
 
+    def verified_update_for_target_model(self ,
+                                         correct_ids_index_path: torch.Tensor,
+                                         new_sample_token_id: torch.Tensor,
+                                         root_index: int) -> torch.Tensor | bool:
+
+        dequeue_num = correct_ids_index_path.size(0)
+        # 更新 verified_pos_len
+        self.verified_pos_len += (dequeue_num + 1)
+        self.dequeue(dequeue_num)
+        if dequeue_num != 0:
+            root_index = correct_ids_index_path[-1]
+        # check head if the new_sample_token_id in head layer
+        mask = torch.isin(self.parents_index[self.head], root_index)
+        new_mask = (mask * self.input_ids_buffer[self.head]) == new_sample_token_id
+        if torch.sum(mask).item() != 0 and torch.any(new_mask):
+            # acc
+            parent_id:torch.Tensor = torch.where(new_mask)[0]
+            new_token_index = parent_id
+            # parent_id = parent_id[0].item()
+            self.dequeue(1)
+        else:
+            # reject
+            # skip current layer
+            self.head += 1
+            self.head %= self.buffer_capacity
+            self.tail = self.head
+            self.size = 0
+            return False
+
+        # 更新 logits 对验证失败的所有其他tokens 的路径进行剪枝
+        # 获取验证的最后一个tensor 的 index, id 可能会重复，所以 要index才行
+
+        # Process through the buffer
+        for i in range(self.size):
+            index = (i + self.head) % self.buffer_capacity
+
+            # Check if we have valid parents
+            mask = torch.isin(self.parents_index[index], parent_id)
+            if torch.sum(mask).item() == 0:
+                self.truncate_path(index)
+                print(f"更新失败，在索引 {index} 处遇到全0的mask")
+                return new_token_index
+
+            # Update weights and logits
+            if i == 0:
+                # First iteration: directly update logits and weights
+                self.logits_buffer[index] *= mask
+                self.weight_buffer[index] = self.logits_buffer[index].clone()
+            else:
+                # Subsequent iterations: calculate weights based on previous
+                prev_index = (index - 1) % self.buffer_capacity
+                self.weight_buffer[index] = self.weight_buffer[prev_index][self.parents_index[index]] * \
+                                            self.logits_buffer[index]
+
+            # Update parent_id for next iteration
+            parent_id = torch.nonzero(mask).view(-1)
+
+        return  new_token_index

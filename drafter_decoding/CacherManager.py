@@ -33,8 +33,10 @@ class CacheManager:
         if self.is_drafter:
             self.is_update = False
             # 第一个位置作为标志位，最长长度支持到 tree.buffer_capacity
-            self.recv_buffer = torch.zeros(tree.buffer_capacity + 1)
+            self.recv_buffer = torch.zeros(tree.buffer_capacity + 2, device=self.device)
         # 开启线程
+        self.lock = threading.Lock()
+        # _get_recv_thread() needs init lock first
         self._get_recv_thread()
 
     def _get_recv_thread(self) -> None:
@@ -60,7 +62,7 @@ class CacheManager:
                 )
                 thread.daemon = True
                 thread.start()
-                thread.join()
+                # thread.join()
 
             elif self.world_size == 3:
                 pass
@@ -79,15 +81,31 @@ class CacheManager:
                     while True:
                         dist.recv(tensor=buffer_combination, src=Config.DRAFTER_RANK)
                         # 接收信息之后放入 tree_buffer 中
-                        self.tree_buffer.update_for_target_model(buffer_combination)
+                        print(f"taraget recv mes {buffer_combination}")
+                        with self.lock:
+                            self.tree_buffer.update_cache_for_target_model(buffer_combination)
 
                 thread = threading.Thread(
                     target=recv_method,
                 )
                 thread.daemon = True
                 thread.start()
-                thread.join()
+                # thread.join()
 
             elif self.world_size == 3:
                 pass
             pass
+
+
+    def query_cache(self):
+        '''用于进行tree_buffer 的cache 选择 for target model and calibration dataset'''
+        return self.tree_buffer.get_candidates_for_target_model()
+
+
+    def update_tree_buffer(self,
+                           correct_ids_index_path: torch.Tensor,
+                           new_sample_token_id: torch.Tensor,
+                           root_index: int
+                           ) -> torch.Tensor | bool:
+        with self.lock:
+            return self.tree_buffer.verified_update_for_target_model(correct_ids_index_path, new_sample_token_id, root_index)
