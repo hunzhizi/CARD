@@ -278,10 +278,10 @@ class DecodingModel(nn.Module):
             # 测试回滚效果
             if tree.size >= 20:
                 tokens, index = tree.pick_path_for_test()
-                tensor1 = torch.tensor(index, device='cuda')
-                tensor2 = torch.tensor(len(index), device='cuda').unsqueeze(0)
-                tensor3 = torch.tensor(0, device='cuda').unsqueeze(0)
-                buffer = torch.cat([tensor2, tensor3, tensor1], dim=-1)
+                tensor1 = torch.tensor(len(index), device='cuda').unsqueeze(0)
+                tensor2 = torch.tensor(0, device='cuda').unsqueeze(0)
+                tensor3 = torch.tensor(index, device='cuda')
+                buffer = torch.cat([tensor1, tensor2, tensor3], dim=-1)
                 outputs = self._verified_update(tree,
                                                 buffer,
                                                 outputs)
