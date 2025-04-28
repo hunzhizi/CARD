@@ -18,11 +18,12 @@ model = DecodingModel.from_pretrained(
 )
 model.eval()
 
-# your_message="Hello, tell me a story about a man who lost his way in the forest and found a treasure."
-your_message="tell me a story about Little bear."
+your_message="Hello, tell me a story about a man who lost his way in the forest and found a treasure."
+# your_message="tell me a story about Little bear."
 
 input_ids=model.tokenizer([your_message]).input_ids
 input_ids = torch.as_tensor(input_ids).cuda()
+model.device = 'cuda'
 output_ids=model.draft_single_card_test(input_ids,nodes_per_layer=20)
 # output_ids=model.autogressive_decoding(input_ids)
 output=model.tokenizer.decode(output_ids[0])

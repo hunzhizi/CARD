@@ -1,7 +1,10 @@
+import threading
 from operator import index
 from typing import Tuple
 
 import torch
+
+from drafter_decoding.Config import Config
 
 
 class Tree:
@@ -18,7 +21,16 @@ class Tree:
         self.position_id = torch.zeros([nodes_per_layer], dtype=torch.long, device=device)
         self.kv_cache_mask = torch.zeros([nodes_per_layer, nodes_per_layer], dtype=torch.int8, device=device)
         self.logits_buffer: torch.Tensor = torch.zeros([max_depth, nodes_per_layer], device=device)
-        self.weight_buffer: torch.Tensor = torch.zeros([max_depth, nodes_per_layer], dtype=torch.float64, device=device)
+        # # 计算总元素数量
+        # total_elements = max_depth * nodes_per_layer * 3
+        # # 创建一个大的连续内存块
+        # buffer = torch.zeros(total_elements, dtype=torch.float32, device=device)
+        # element_size = max_depth * nodes_per_layer
+        # self.weight_buffer = buffer[:element_size].view(max_depth, nodes_per_layer).to(dtype=torch.float32)
+        # self.input_ids_buffer = buffer[element_size:2 * element_size].view(max_depth, nodes_per_layer).to(
+        #     dtype=torch.int)
+        # self.parents_index = buffer[2 * element_size:].view(max_depth, nodes_per_layer).to(dtype=torch.int)
+        self.weight_buffer: torch.Tensor = torch.zeros([max_depth, nodes_per_layer], dtype=torch.float32, device=device)
         self.input_ids_buffer: torch.Tensor = torch.zeros([max_depth, nodes_per_layer], dtype=torch.int, device=device)
         self.parents_index: torch.Tensor = torch.zeros([max_depth, nodes_per_layer], dtype=torch.int, device=device)
         self.rows: torch.Tensor = torch.arange(nodes_per_layer, device=self.device)
@@ -36,6 +48,8 @@ class Tree:
         self.best_candidates:list = list()
         self.chosen_id = -1  # 用于保存当cache全都被命中后的 logits 的选择，或者当被拒绝后重新选择的logits的 id
         self.parent_id = 0 # 用于维护 update_for_target_model 中的 parent_id
+        self.global_condition = threading.Condition()  # 全局条件变量 用于等待
+
 
     def set_device(self, device: torch.device):
         self.device = device
@@ -50,6 +64,10 @@ class Tree:
         # 更新 tail 的 index 并维护 桶的大小
         self.tail = (self.tail + 1) % self.buffer_capacity
         self.size += 1
+        if self.size >=Config.PREDICTION_NUM:
+            with self.global_condition:
+                self.global_condition.notify()
+                print(f" notify the condition")
 
     def enqueue(self,
                 logits: torch.Tensor) -> (torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor):
@@ -108,6 +126,12 @@ class Tree:
         # 用于目标模型验证成功后更新 cache
         if self.size - dequeue_num < 0:
             raise RuntimeError(f"Buffer is empty, cannot dequeue")
+        end = self.head + dequeue_num
+        if self.head < end:
+            self.weight_buffer[self.head:end].zero_()
+        else:
+            self.weight_buffer[self.head:].zero_()
+            self.weight_buffer[:end].zero_()
         self.head = (self.head + dequeue_num) % self.buffer_capacity
         self.size -= dequeue_num
 
@@ -159,7 +183,7 @@ class Tree:
     def verified_update(self,
                         correct_ids_index_path: torch.Tensor,
                         is_reject: bool = False) -> torch.Tensor | None:
-        # 更新 mask
+        # 重置 mask
         self.kv_mask = torch.zeros([self.nodes_per_layer, 0], dtype=torch.int8, device=self.kv_mask.device)
         # self.kv_cache_mask.fill_(0)
 
@@ -170,8 +194,11 @@ class Tree:
         self.verified_pos_len += dequeue_num
         if is_reject is True:
             # 将后面的 buffer 清零
-            self.head = self.tail
+            self.head += 1
+            self.head %= self.buffer_capacity
+            self.tail = self.head
             self.size = 0
+            self.verified_pos_len += 1
             return False
         # if self.is_empty():
         #     # 更新选中的 logits 的对应的 id
@@ -190,8 +217,10 @@ class Tree:
             print(f"更新失败")
             return parent_id
         # 更新对应的weight 和 logits
-        self.logits_buffer[index] *= mask
-        self.weight_buffer[index] = self.logits_buffer[index].clone()
+        # self.logits_buffer[index] *= mask
+        self.logits_buffer[index].copy_(self.logits_buffer[index]*mask)
+        # self.weight_buffer[index] = self.logits_buffer[index].clone()
+        self.weight_buffer[index].copy_(self.logits_buffer[index])
         parent_id = torch.nonzero(mask).view(-1)
         for i in range(1, self.size):
             index = (i + self.head) % self.buffer_capacity
@@ -201,7 +230,8 @@ class Tree:
                 print(f"更新失败")
                 return parent_id
             # 更新对应的weight 和 logits
-            self.weight_buffer[index] = self.weight_buffer[(index - 1) % self.buffer_capacity][self.parents_index[index]] * self.logits_buffer[index]
+            # self.weight_buffer[index] = self.weight_buffer[(index - 1) % self.buffer_capacity][self.parents_index[index]] * self.logits_buffer[index]
+            self.weight_buffer[index].copy_(self.weight_buffer[(index - 1) % self.buffer_capacity][self.parents_index[index]] * self.logits_buffer[index])
             parent_id = torch.nonzero(mask).view(-1)
 
             # skip the first one
@@ -240,9 +270,9 @@ class Tree:
 
     def update_cache_for_target_model(self, combination_buffer: torch.Tensor):
         '''
-        to maintain the tree cache for target model
+        to maintain the tree cache for target model,
         Args:
-            combination_buffer: combination of received buffer
+            combination_buffer: combination of received buffer from cache manager
 
         Returns:
 
@@ -250,24 +280,33 @@ class Tree:
         # 1. 做解包
         # 2. 更新
         offset = self.nodes_per_layer
-        self.logits_buffer[self.tail] = combination_buffer[:offset]
-        self.weight_buffer[self.tail] = combination_buffer[offset:2 * offset].to(torch.float64)
-        self.input_ids_buffer[self.tail] = combination_buffer[offset * 2: offset * 3].to(torch.int)
-        self.parents_index[self.tail] = combination_buffer[offset * 3 :].to(torch.int)
-        self.update_tail()
+        self.logits_buffer.copy_(combination_buffer[:,:offset])
+        self.weight_buffer.copy_(combination_buffer[:,offset:2*offset])
+        self.input_ids_buffer.copy_(combination_buffer[:,2*offset:3*offset].to(torch.int))
+        self.parents_index.copy_(combination_buffer[:,3*offset:4*offset].to(torch.int))
+        self.head = int(combination_buffer[0][-1].item())
+        self.tail = int(combination_buffer[1][-1].item())
+        self.size = int(combination_buffer[2][-1].item())
+        print(f"target model recv tree state is {self.head, self.tail, self.size}")
 
 
     def get_send_msg_for_drafter(self) -> torch.Tensor:
         '''
-        after enqueue ,we need to send msg to target model to notice the target model
+        send whole tree info msg to target model to notice the target model
+        I don't need logits info to update target model
+        I need weight_buffer input_ids_buffer parents_index
         Returns:
             torch.Tensor combination_buffer of send msg
         '''
-        index = (self.tail - 1) % self.buffer_capacity
-        combination_buffer = torch.cat([self.logits_buffer[index],
-                    self.weight_buffer[index],
-                    self.input_ids_buffer[index],
-                    self.parents_index[index]],dim=-1)
+        tree_state = torch.zeros(self.buffer_capacity,1, device=self.device)
+        tree_state[0][0] = self.head
+        tree_state[1][0] = self.tail
+        tree_state[2][0] = self.size
+        combination_buffer = torch.cat([self.logits_buffer,
+                                                self.weight_buffer,
+                                                self.input_ids_buffer.to(torch.float32),
+                                                self.parents_index.to(torch.float32),
+                                                tree_state],dim=-1)
         return combination_buffer
 
 
@@ -283,13 +322,13 @@ class Tree:
         head = self.head
         weights = self.weight_buffer[head].clone()
         parent_id = torch.argmax(weights)
-        root_index = self.parents_index[parent_id]
+        root_index = self.parents_index[head][parent_id]
         for i in range(self.size):
             # greedy choose cache tokens
             parent_id = torch.argmax(weights)
-            picked_index.append(parent_id)
+            picked_index.append(parent_id.item())
             best_candidate.append(self.input_ids_buffer[head][parent_id].item())
-            head += +1
+            head += 1
             head %= self.buffer_capacity
             mask = torch.isin(self.parents_index[head], parent_id)
             if torch.sum(mask).item() == 0:
@@ -297,16 +336,26 @@ class Tree:
                 break
             weights = self.weight_buffer[head].clone()
             weights *= mask
-
+        print(f"tuple is {best_candidate,picked_index,root_index}")
+        print(f"退出 get candidates for target model")
         return best_candidate,picked_index,root_index
 
 
     def verified_update_for_target_model(self ,
-                                         correct_ids_index_path: torch.Tensor,
+                                         correct_ids_index_path: list,
                                          new_sample_token_id: torch.Tensor,
                                          root_index: int) -> torch.Tensor | bool:
+        '''
+        更新树并返回 best candidates
+        Args:
+            correct_ids_index_path: 正确的 index 索引
+            new_sample_token_id: 新 sample 出来的 token id
+            root_index: 根节点也是最后一个验证成功位置的tokne的 index ,其作为 parent id
 
-        dequeue_num = correct_ids_index_path.size(0)
+        Returns:
+
+        '''
+        dequeue_num = len(correct_ids_index_path)
         # 更新 verified_pos_len
         self.verified_pos_len += (dequeue_num + 1)
         self.dequeue(dequeue_num)

@@ -72,7 +72,7 @@ class DecodingModel(nn.Module):
             self.target_model_rank_num = self.drafters_num
             self.dataset_name = ""
             self.verified_len: int = 0
-
+            dist.barrier()
             return
         self.model = model
         self.hidden_size = model.lm_head.weight.shape[-1]
@@ -165,7 +165,7 @@ class DecodingModel(nn.Module):
         return attention_mask
 
     def autogressive_decoding(self,
-                              input_ids: int) -> torch.Tensor:
+                              input_ids: torch.Tensor) -> torch.Tensor:
         assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
         # Avoid modifying the input_ids in-place
         input_ids = input_ids.clone()
@@ -279,7 +279,7 @@ class DecodingModel(nn.Module):
             if tree.size >= 20:
                 tokens, index = tree.pick_path_for_test()
                 tensor1 = torch.tensor(len(index), device='cuda').unsqueeze(0)
-                tensor2 = torch.tensor(0, device='cuda').unsqueeze(0)
+                tensor2 = torch.tensor(799, device='cuda').unsqueeze(0)
                 tensor3 = torch.tensor(index, device='cuda')
                 buffer = torch.cat([tensor1, tensor2, tensor3], dim=-1)
                 outputs = self._verified_update(tree,
@@ -355,7 +355,6 @@ class DecodingModel(nn.Module):
         # 通过 Tree 类进行管理
         input_ids, position_ids, tree_attention_mask, parents = tree.enqueue(
             torch.softmax(outputs[0], dim=-1, dtype=torch.float32))
-        work = dist.isend(tree.get_send_msg_for_drafter(), dst=Config.TARGET_MODEL_RANK)
         tree_attention_mask = self.process_tree_mask(tree_attention_mask, init_len)
         # drafter decoding
         while True:
@@ -382,9 +381,8 @@ class DecodingModel(nn.Module):
             # 可以根据 seq_len 来判断当前处理情况是一层树，还是只是正常推理
             input_ids, position_ids, tree_attention_mask, parents = tree.enqueue(
                 torch.softmax(outputs[0], dim=-1, dtype=torch.float32))
-            work = dist.isend(tree.get_send_msg_for_drafter(),dst=Config.TARGET_MODEL_RANK)
+            color_print(f"drafter send msg to target model ")
             tree_attention_mask = self.process_tree_mask(tree_attention_mask, self.verified_len)
-            color_print(f"input_ids are {input_ids}", self.rank)
 
 
     @torch.no_grad()
@@ -404,7 +402,6 @@ class DecodingModel(nn.Module):
         # todo init distributed env
 
         cache_manager = CacheManager(self.world_size, self.rank, self.device, tree_buffer, is_target_model=True)
-        color_print(f"执行")
 
         # prefill phase merged into decoding phase
         model = KVCacheModel(self.model, init_input_len=input_ids.shape[1])
@@ -412,54 +409,81 @@ class DecodingModel(nn.Module):
         # input_ids = model.generate(input_ids)
         # decode phase
         output_token_ids = input_ids.clone()
+        # 在第一次进行 decode 过程先查询 cache
+        query_flag = torch.zeros(1, device=model.device,dtype=torch.int)
+        dist.isend(query_flag, dst=Config.DRAFTER_RANK)
+        cache_manager.recv_buffer_for_target_model()
+        cache_manager.update_cache_for_target_model()
+        hit_cache = True
+        send_verified_index_buffer = torch.zeros(tree_buffer.buffer_capacity + 2, device=self.device, dtype=torch.int)
         while True:
+            if hit_cache is False:
+                # 被拒绝重新请求 cache
+                color_print(f"hit_cache is {hit_cache}", self.rank)
+                dist.send(query_flag, dst=Config.DRAFTER_RANK)
+                cache_manager.recv_buffer_for_target_model()
+                cache_manager.update_cache_for_target_model()
             # 1. query cache
             best_candidates, picked_index, root_index = cache_manager.query_cache()
+            color_print(f"target model 查询cache 结果为best_candidates, picked_index, root_index:{best_candidates, picked_index, root_index}",self.rank)
             best_candidates = torch.tensor(best_candidates, device=self.device, dtype=torch.int).unsqueeze(0)
             # 2. decode with cache
             if model._past_key_values is None:
                 best_candidates = torch.cat([input_ids, best_candidates], dim=-1)
+            else:
+                best_candidates = torch.cat([new_sample_token.unsqueeze(0),best_candidates],dim=-1)
             token_ids = model.generate(best_candidates)
+            color_print(f"target model 生成 token_ids:{token_ids}",self.rank)
+            cache_manager.recv_buffer_for_target_model()
             # [debug]
-            color_print(f"target model token_ids are {token_ids}",self.rank)
             # 1d token_ids
             # 保存输出
             output_token_ids = torch.cat([output_token_ids, token_ids.unsqueeze(0)], dim=-1)
+            color_print(f"output_token_ids is {output_token_ids}",self.rank)
+            color_print(self.tokenizer.decode(output_token_ids[0]),5)
             # tokens_ids is 1-d tensor
             # 3. check if all verified tokens in cache
             # let me clear: what is accept and reject?
             # as long as all the tokens_ids are in tree_buffer, that means accept .the other will be rejection
             # 3.1 update tree buffer
-            correct_ids_index_path = picked_index[:token_ids.shape[0] - 1]
-            new_sample_token = token_ids[-1]
+            correct_ids_index_path:list | torch.Tensor = picked_index[:token_ids.shape[0] - 1]
+            new_sample_token = token_ids[-1].unsqueeze(0)
+            cache_manager.update_cache_for_target_model()
             hit_cache = cache_manager.update_tree_buffer(correct_ids_index_path, new_sample_token,
                                                          root_index=root_index)
+            correct_ids_index_path = torch.tensor(correct_ids_index_path,device=self.device)
+            color_print(f"correct_ids_index_path is {correct_ids_index_path}",self.rank)
             # hit_cache 如果不为 false 则其为 一个 tensor 里面表示 new_token_idx
             if hit_cache:
                 # 命中cache
                 #   3.1 acc (could find a path in cache)
-                seq_len = torch.tensor(token_ids.shape[0], device=self.device) + 1
-                pad = torch.tensor(0, device=self.device)
-                send_msg = torch.cat([seq_len, pad, token_ids, hit_cache], dim=-1)
+                seq_len = torch.tensor(token_ids.shape[0], device=self.device).unsqueeze(0)
+                pad = torch.tensor(0, device=self.device).unsqueeze(0)
+                send_msg = torch.cat([seq_len, pad, correct_ids_index_path, hit_cache], dim=-1)
             else:
                 # 未命中，发送格式
                 # index[0] = -1 序列被拒绝
                 # index[1] 被拒绝后的token
                 #   3.2 reject  (could not find a path in cache)
-                seq_len = torch.tensor(token_ids.shape[0], device=self.device) + 1
-                send_msg = torch.cat([seq_len, new_sample_token, token_ids], dim=-1)
+                seq_len = torch.tensor(correct_ids_index_path.shape[0], device=self.device).unsqueeze(0)
+                color_print(f"seq_len, new_sample_token, correct_ids_index_path is {seq_len, new_sample_token, correct_ids_index_path}",self.rank)
+                send_msg = torch.cat([seq_len, new_sample_token, correct_ids_index_path], dim=-1).to(torch.int)
 
             # 4. isend message including index info to drafter
-            work = dist.isend(send_msg, dst=Config.TARGET_MODEL_RANK)
+            color_print(f"target model send_msg is {send_msg}",self.rank)
+            send_verified_index_buffer[0:send_msg.shape[0]].copy_(send_msg)
+            # dist.send(send_msg, dst=Config.DRAFTER_RANK)
+            dist.send(send_verified_index_buffer, dst=Config.DRAFTER_RANK)
             # currently send a 1-d tensor todo to align the dim with the receiver
 
-            # 5.  rollback kv_cache
-            model.rollback(output_token_ids.shape[1])
+            # 5.  rollback kv_cache 不能算上 新 sample 出来的token
+            color_print(f"回滚到{output_token_ids.shape[1] - 1}",self.rank)
+            model.rollback(output_token_ids.shape[1] - 1)
 
             # 6. wait()
-            work.wait()
-            tree_buffer.tail = tree_buffer.pending_tail
-            tree_buffer.size = (tree_buffer.tail - tree_buffer.head) % tree_buffer.buffer_capacity
+            # work.wait()
+            # tree_buffer.tail = tree_buffer.pending_tail
+            # tree_buffer.size = (tree_buffer.tail - tree_buffer.head) % tree_buffer.buffer_capacity
 
     def _rollback_kv_cache(self,
                            correct_ids_index_path: torch.Tensor,
@@ -469,6 +493,9 @@ class DecodingModel(nn.Module):
         start = self.verified_len
 
         tokens_len = correct_ids_index_path.size(0)
+        if tokens_len == 0:
+            self._kv_cache_truncate(start)
+            return
         indices = torch.arange(correct_ids_index_path.numel(), device=correct_ids_index_path.device,
                                dtype=correct_ids_index_path.dtype)
         indices = start + correct_ids_index_path + indices * nodes_per_layer
@@ -494,16 +521,19 @@ class DecodingModel(nn.Module):
                          outputs) -> torch.Tensor:
         # 规定 在 tensor 第一个位置为标志位
         # 标志位 index[0] > 0:index[0]为验证序列长度
-        # 标志位 index[0]== -1 ： 序列被拒绝， 注意，当序列被拒绝不一定长度为1
+        # 标志位 index[1] == -1 ： 序列被拒绝， 注意，当序列被拒绝不一定长度为1
         # 标志位 index[1] 为 被拒绝后的 token_id
+        color_print(f"correct_ids_index_path is {correct_ids_index_path}",3)
         length = int(correct_ids_index_path[0].item())
+        flag = int(correct_ids_index_path[1].item())
         # 正确的 token ids  index 序列
         correct_ids_index_path = correct_ids_index_path[2:length + 2]
 
-        if length == -1:
+        if flag != 0:
             # 先回滚，然后携带正确 token 正常推理一次，更新树
             self._rollback_kv_cache(correct_ids_index_path, tree.nodes_per_layer, is_reject=True)
-            input_id = correct_ids_index_path[1].unsqueeze(0).unsqueeze(0)
+            input_id = torch.tensor(flag,dtype=torch.int, device=self.device).unsqueeze(0).unsqueeze(0)
+            color_print(f"被拒绝后进行推理的 tokenid is{input_id}",3)
             outputs = self.model(
                 input_ids=input_id,
                 attention_mask=None,
@@ -511,8 +541,9 @@ class DecodingModel(nn.Module):
                 past_key_values=self.past_key_values,
                 position_ids=None,
             )
+            # 此时verified_update 在tree会跳过一层layer
             tree.verified_update(correct_ids_index_path, is_reject=True)
-            self.verified_len += correct_ids_index_path.size(0)
+            self.verified_len += 1
             return outputs
 
         # 进行 kv——cache 回滚
@@ -527,7 +558,7 @@ class DecodingModel(nn.Module):
             # 2. enqueue using level_2_cache
             input_ids, position_ids, tree_attention_mask, parents = tree.enqueue_using_level2cache(parent_id)
             # 3. send message
-            work = dist.isend(tree.get_send_msg_for_drafter(),dst=Config.TARGET_MODEL_RANK)
+            # I don't send message I will change the communication method
             # 4. decode once and get output
             tree_attention_mask = self.process_tree_mask(tree_attention_mask, self.verified_len)
             outputs = self.model(

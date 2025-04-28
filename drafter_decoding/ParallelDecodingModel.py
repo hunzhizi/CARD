@@ -14,7 +14,7 @@ class ParallelDecodingModel(DecodingModel):
             encode_special_token_flag = not (
                         "Llama-3.2-1B-Instruct" in self.parser_args.draft_models_dir and "Llama-3.1-8B-Instruct" in self.parser_args.target_model)
             input_ids = self.tokenizer.encode(
-                "Imagine a world where gravity reverses every 24 hours. Describe its societal, scientific, and architectural consequences.",
+                "tell me a story about little bear.",
                 add_special_tokens=encode_special_token_flag)
             input_ids = torch.tensor(input_ids).unsqueeze(0).to(self.device)
             if self.is_target_model:

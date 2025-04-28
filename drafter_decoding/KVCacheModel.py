@@ -2,7 +2,7 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
-from time import perf_counter
+import torch.distributed as dist
 from transformers.generation.logits_process import (
     LogitsProcessorList,
     RepetitionPenaltyLogitsProcessor,
@@ -10,6 +10,8 @@ from transformers.generation.logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
+
+from drafter_decoding.Config import Config
 
 
 def prepare_logits_processor(
@@ -32,7 +34,7 @@ def prepare_logits_processor(
 
 
 class KVCacheModel(nn.Module):
-    def __init__(self, model: torch.nn.Module, init_input_len: int, temperature: float = 1, top_k: int = 0,
+    def __init__(self, model: torch.nn.Module, init_input_len: int, temperature: float = 0, top_k: int = 0,
                  top_p: float = 0,
                  vocab_size: int = None, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -44,7 +46,10 @@ class KVCacheModel(nn.Module):
             self.logits_processor = prepare_logits_processor(temperature=temperature, top_p=top_p, top_k=top_k)
 
         self.sum = 0
+        self.device = model.device
         self.init_input_len = init_input_len
+        self.handshake_flag = torch.ones(1, device=model.device, dtype=torch.int)
+
 
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -65,6 +70,7 @@ class KVCacheModel(nn.Module):
         return tokens_id
 
     def compare_tensors(self, tensor1, tensor2):
+        print(f" tensor2 is {tensor2}, tensor1 is {tensor1}")
         assert len(tensor2) == len(tensor1) + 1, "tensor2的长度必须比tensor1大1"
         length = len(tensor1)
         # 直接比较前length个元素，生成差异掩码
@@ -73,7 +79,7 @@ class KVCacheModel(nn.Module):
         if not torch.any(diff_mask):
             return tensor2
         # 找到第一个不同位置的索引
-        first_diff_index = torch.argmax(diff_mask)
+        first_diff_index = torch.argmax(diff_mask.int())
         # 返回公共部分及tensor2中的不同元素
         return tensor2[:first_diff_index + 1]
 
@@ -91,6 +97,8 @@ class KVCacheModel(nn.Module):
             # only support for bs == 1
             prefix = prefix[:, self.init_input_len:]
             # new_tokens = new_tokens[0, self.init_input_len:]
+        else:
+            prefix = prefix[:,1:]
         # verify the new_tokens
         return self.compare_tensors(prefix[0], new_tokens[0])
 
@@ -103,12 +111,16 @@ class KVCacheModel(nn.Module):
             for k, v in self._past_key_values
         ]
         self.current_verified_len = end_pos
+        print(f"self._past_key_values[0][0].shape[2] is {self._past_key_values[0][0].shape[2]}")
 
     def _forward_with_kvcache(self, input_ids: torch.Tensor) -> torch.FloatTensor:
         # 第一次推理没有保存kvcache ，此时调用forward
         if self._past_key_values is None:
-            print(f"input_ids are {input_ids}")
+            # print(f"input_ids are {input_ids}")
             outputs = self._model(input_ids)
+            # send msg to get tree info asynchronously
+            # 这里其实不太符合开闭原则,但是为了 asynchronously 最好是在这里进行tree info 的获取
+            dist.isend(self.handshake_flag,dst=Config.DRAFTER_RANK)
 
             # logit shape is (batch_size, sequence_length, vocab_size)
             if (outputs.logits.dim() == 2):
@@ -121,17 +133,22 @@ class KVCacheModel(nn.Module):
             # 有kvcache 进行的推理
             # return the last token's logits
             # 注意： 这里的 seq_len 不是input_ids 的len 是含有kvcache的 seq len 不包含上次cat 的tokens
-            seq_len = self._past_key_values[0][0].shape[2]
+            # seq_len = self._past_key_values[0][0].shape[2]
             # caution 这里获取 seq_len 并不是脱裤子放屁，很重要的一步操作，因为seq_len 后面有一些tokens被接受了，但是没有kvcache
-            new_input_id = input_ids[:, seq_len:]
+            # new_input_id = input_ids[:, seq_len:]
+            new_input_id = input_ids
             # 保证 input_id.dim() == 2
             if new_input_id.dim() == 1:
                 new_input_id = torch.unsqueeze(new_input_id, 0)
 
             # 进行推理，传入当前 token_id 和 past_key_values ,使用use_cache 进行推理
+            # print(f"target model self._model \n input_ids is {new_input_id}")
             outputs = self._model(input_ids=new_input_id,
                                   past_key_values=self._past_key_values,
                                   use_cache=True)
+            # send msg to get tree info asynchronously
+            # 这里其实不太符合开闭原则,但是为了 asynchronously 最好是在这里进行tree info 的获取
+            dist.isend(self.handshake_flag,dst=Config.DRAFTER_RANK)
 
             logits = outputs.logits
 
@@ -140,14 +157,15 @@ class KVCacheModel(nn.Module):
 
         if self.logits_processor is None:
             new_tokens = torch.argmax(logits, dim=-1)
+            # print(f" new tokens are {new_tokens}")
         else:
             logits = self.logits_processor(None, logits)
             probabilities = torch.nn.functional.softmax(logits, dim=-1)[0]
             new_tokens = torch.multinomial(probabilities, 1).view(1, -1)
-
+            # print(f" new tokens are logits_processor {new_tokens}")
             # self.current_verified_len += outputs.logits.size(1)
 
             # last_token_logits = logits[:, -1, :]
-            self._past_key_values = outputs.past_key_values
+        self._past_key_values = outputs.past_key_values
 
         return new_tokens
