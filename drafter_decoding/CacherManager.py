@@ -38,6 +38,7 @@ class CacheManager:
             self.is_update = False
             # 第一个位置作为标志位，最长长度支持到 tree.buffer_capacity
             self.recv_buffer = torch.zeros(tree.buffer_capacity + 2, device=self.device ,dtype=torch.int)
+            self.is_decoding = True     # 用于结束草稿模型推理
         # 开启线程
         self.handshake_flag = torch.zeros(1,device=device,dtype=torch.int)
         self.combination_buffer = torch.zeros(tree.buffer_capacity,tree.nodes_per_layer * 4 + 1, device=self.device)
@@ -65,6 +66,9 @@ class CacheManager:
                         color_print(f"_get_recv_thread 准备get recv msg {self.handshake_flag}")
                         dist.recv(self.handshake_flag, src=Config.TARGET_MODEL_RANK)
                         color_print(f"_get_recv_thread get recv msg {self.handshake_flag}")
+                        if self.handshake_flag == -1:
+                            self.is_decoding = False
+                            return
                         # handshake_flag == 0 表示 单纯拉取 target model 第一次进行query cache 此时没有验证信息，只需要拉去cache,
                         # 或者当target model 被拒绝后再一次拉去信息
                         # handshake_flag == 1 表示 握手通讯

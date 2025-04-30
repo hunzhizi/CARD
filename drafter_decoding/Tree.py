@@ -5,7 +5,10 @@ from typing import Tuple
 import torch
 
 from drafter_decoding.Config import Config
-
+def color_print(content: str, color_number: int = 4):
+    """print content with color. Some color numbers are listed: Gray: 0, Red: 1, Green: 2, Yellow: 3, Blue: 4."""
+    # if self.accelerator.is_main_process:
+    print(f"\033[9{color_number}m{content}\033[0m")
 
 class Tree:
     def __init__(self,
@@ -359,16 +362,23 @@ class Tree:
         # 更新 verified_pos_len
         self.verified_pos_len += (dequeue_num + 1)
         self.dequeue(dequeue_num)
+        color_print(f"self.index is {self.input_ids_buffer[(self.head - 1)% self.buffer_capacity]}",2)
         if dequeue_num != 0:
             root_index = correct_ids_index_path[-1]
+        if self.is_empty():     # todo is return root_index right?
+            print(f"torch.tensor(root_index,device=self.device,dtype=torch.int).unsqueeze(0) is {torch.tensor(root_index,device=self.device,dtype=torch.int).unsqueeze(0)}")
+            return torch.tensor(root_index,device=self.device,dtype=torch.int).unsqueeze(0)
         # check head if the new_sample_token_id in head layer
         mask = torch.isin(self.parents_index[self.head], root_index)
+        color_print(f"mask is {mask}",2)
         new_mask = (mask * self.input_ids_buffer[self.head]) == new_sample_token_id
+        color_print(f"new mask is {new_mask}", 2)
         if torch.sum(mask).item() != 0 and torch.any(new_mask):
             # acc
             parent_id:torch.Tensor = torch.where(new_mask)[0]
             new_token_index = parent_id
             # parent_id = parent_id[0].item()
+            print(f" ready to dequeue {self.head},{self.tail},{self.size}")
             self.dequeue(1)
         else:
             # reject
@@ -378,7 +388,7 @@ class Tree:
             self.tail = self.head
             self.size = 0
             return False
-
+        # todo some operations below is useless? for target model it's useless to update the weight matrix from logits. to debug and delete
         # 更新 logits 对验证失败的所有其他tokens 的路径进行剪枝
         # 获取验证的最后一个tensor 的 index, id 可能会重复，所以 要index才行
 
@@ -396,13 +406,12 @@ class Tree:
             # Update weights and logits
             if i == 0:
                 # First iteration: directly update logits and weights
-                self.logits_buffer[index] *= mask
-                self.weight_buffer[index] = self.logits_buffer[index].clone()
+                self.logits_buffer[index].copy_(self.logits_buffer[index] * mask)
+                self.weight_buffer[index].copy_(self.logits_buffer[index])
             else:
                 # Subsequent iterations: calculate weights based on previous
                 prev_index = (index - 1) % self.buffer_capacity
-                self.weight_buffer[index] = self.weight_buffer[prev_index][self.parents_index[index]] * \
-                                            self.logits_buffer[index]
+                self.weight_buffer[index].copy_(self.weight_buffer[prev_index][self.parents_index[index]] * self.logits_buffer[index])
 
             # Update parent_id for next iteration
             parent_id = torch.nonzero(mask).view(-1)

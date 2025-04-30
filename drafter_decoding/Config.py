@@ -5,7 +5,7 @@ class Config:
     _heng_yuan_yun = "/hy-tmp"
     _3090ti = "/mnt/data/zhouShaoRepo/model"
     MODEL_DIR = _heng_yuan_yun
-    PREDICTION_NUM = 2
+    PREDICTION_NUM = 1
 
 if __name__ == '__main__':
     import torch

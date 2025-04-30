@@ -3,6 +3,7 @@ from typing import Tuple
 
 import torch.nn as nn
 import torch
+
 from .CacherManager import CacheManager
 from .Config import Config
 from .KVCacheModel import KVCacheModel
@@ -156,6 +157,11 @@ class DecodingModel(nn.Module):
         # cls() 调用 MyClass 的 __init__ 方法创建了一个新实例
         return cls(model, draft_model_path, device=main_device)
 
+    def color_print(self, content: str, color_number: int = 4):
+        """print content with color. Some color numbers are listed: Gray: 0, Red: 1, Green: 2, Yellow: 3, Blue: 4."""
+        # if self.accelerator.is_main_process:
+        print(f"\033[9{color_number}m{content}\033[0m")
+
     def process_tree_mask(self, tree_attention_mask, init_len):
         # todo 考虑封装到 Tree 中
         attention_mask = torch.full((tree_attention_mask.size(0), init_len), 0, device=tree_attention_mask.device)
@@ -164,7 +170,7 @@ class DecodingModel(nn.Module):
         attention_mask = attention_mask[None, None, :, :]
         return attention_mask
 
-    def autogressive_decoding(self,
+    def autoregressive_decoding(self,
                               input_ids: torch.Tensor) -> torch.Tensor:
         assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
         # Avoid modifying the input_ids in-place
@@ -357,7 +363,7 @@ class DecodingModel(nn.Module):
             torch.softmax(outputs[0], dim=-1, dtype=torch.float32))
         tree_attention_mask = self.process_tree_mask(tree_attention_mask, init_len)
         # drafter decoding
-        while True:
+        while cache_manager.is_decoding:
             # if self.tokenizer.eos_token_id == input_ids:
             #     break
             # input_ids = input_ids.unsqueeze(0).unsqueeze(0)
@@ -404,7 +410,8 @@ class DecodingModel(nn.Module):
         cache_manager = CacheManager(self.world_size, self.rank, self.device, tree_buffer, is_target_model=True)
 
         # prefill phase merged into decoding phase
-        model = KVCacheModel(self.model, init_input_len=input_ids.shape[1])
+        init_len = input_ids.shape[1]
+        model = KVCacheModel(self.model, init_input_len=init_len)
         # Initialize the past key and value states
         # input_ids = model.generate(input_ids)
         # decode phase
@@ -416,7 +423,9 @@ class DecodingModel(nn.Module):
         cache_manager.update_cache_for_target_model()
         hit_cache = True
         send_verified_index_buffer = torch.zeros(tree_buffer.buffer_capacity + 2, device=self.device, dtype=torch.int)
-        while True:
+        start = time.perf_counter()
+        max_length = 100
+        for i in range(max_length):
             if hit_cache is False:
                 # 被拒绝重新请求 cache
                 color_print(f"hit_cache is {hit_cache}", self.rank)
@@ -425,7 +434,7 @@ class DecodingModel(nn.Module):
                 cache_manager.update_cache_for_target_model()
             # 1. query cache
             best_candidates, picked_index, root_index = cache_manager.query_cache()
-            color_print(f"target model 查询cache 结果为best_candidates, picked_index, root_index:{best_candidates, picked_index, root_index}",self.rank)
+            color_print(f"tree size 大小为{tree_buffer.size}\ntarget model 查询cache 结果为best_candidates, picked_index, root_index:{best_candidates, picked_index, root_index}",self.rank)
             best_candidates = torch.tensor(best_candidates, device=self.device, dtype=torch.int).unsqueeze(0)
             # 2. decode with cache
             if model._past_key_values is None:
@@ -433,13 +442,14 @@ class DecodingModel(nn.Module):
             else:
                 best_candidates = torch.cat([new_sample_token.unsqueeze(0),best_candidates],dim=-1)
             token_ids = model.generate(best_candidates)
+
             color_print(f"target model 生成 token_ids:{token_ids}",self.rank)
             cache_manager.recv_buffer_for_target_model()
             # [debug]
             # 1d token_ids
             # 保存输出
             output_token_ids = torch.cat([output_token_ids, token_ids.unsqueeze(0)], dim=-1)
-            color_print(f"output_token_ids is {output_token_ids}",self.rank)
+            # color_print(f"len is {output_token_ids.shape[1]}output_token_ids is {output_token_ids}",self.rank)
             color_print(self.tokenizer.decode(output_token_ids[0]),5)
             # tokens_ids is 1-d tensor
             # 3. check if all verified tokens in cache
@@ -454,12 +464,12 @@ class DecodingModel(nn.Module):
             correct_ids_index_path = torch.tensor(correct_ids_index_path,device=self.device)
             color_print(f"correct_ids_index_path is {correct_ids_index_path}",self.rank)
             # hit_cache 如果不为 false 则其为 一个 tensor 里面表示 new_token_idx
-            if hit_cache:
+            if hit_cache is not False:
                 # 命中cache
                 #   3.1 acc (could find a path in cache)
                 seq_len = torch.tensor(token_ids.shape[0], device=self.device).unsqueeze(0)
                 pad = torch.tensor(0, device=self.device).unsqueeze(0)
-                send_msg = torch.cat([seq_len, pad, correct_ids_index_path, hit_cache], dim=-1)
+                send_msg = torch.cat([seq_len, pad, correct_ids_index_path, hit_cache], dim=-1).to(torch.int)
             else:
                 # 未命中，发送格式
                 # index[0] = -1 序列被拒绝
@@ -475,15 +485,14 @@ class DecodingModel(nn.Module):
             # dist.send(send_msg, dst=Config.DRAFTER_RANK)
             dist.send(send_verified_index_buffer, dst=Config.DRAFTER_RANK)
             # currently send a 1-d tensor todo to align the dim with the receiver
-
+            # after the last communication , check if to end. 一定在这个位置 check，要不然会不正常结束
+            if self.tokenizer.eos_token_id in token_ids.tolist():
+                break
             # 5.  rollback kv_cache 不能算上 新 sample 出来的token
-            color_print(f"回滚到{output_token_ids.shape[1] - 1}",self.rank)
             model.rollback(output_token_ids.shape[1] - 1)
+            color_print(f"tokens/s is {(output_token_ids.shape[1] - init_len) / (time.perf_counter() - start)}\n output_len is {output_token_ids.shape[1]}",5)
+        return output_token_ids
 
-            # 6. wait()
-            # work.wait()
-            # tree_buffer.tail = tree_buffer.pending_tail
-            # tree_buffer.size = (tree_buffer.tail - tree_buffer.head) % tree_buffer.buffer_capacity
 
     def _rollback_kv_cache(self,
                            correct_ids_index_path: torch.Tensor,
