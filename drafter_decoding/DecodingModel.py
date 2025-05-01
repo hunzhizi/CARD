@@ -9,6 +9,7 @@ from .Config import Config
 from .KVCacheModel import KVCacheModel
 from .Tree import Tree
 from .modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
+from .modeling_qwen2_kv import Qwen2ForCausalLM as KVQwen2ForCausalLM
 from drafter_decoding.kv_cache import initialize_past_key_values
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 import torch.distributed as dist
@@ -63,6 +64,12 @@ class DecodingModel(nn.Module):
             self.hidden_size = self.model.lm_head.weight.shape[-1]
             self.vocab_size = self.model.lm_head.weight.shape[0]
             self.tokenizer = AutoTokenizer.from_pretrained(self.parser_args.target_model_dir)
+            self.is_llama: bool = False
+            self.is_qwen: bool = False
+            if 'llama' in self.parser_args.target_model_dir.lower(): # default is llama
+                self.is_llama = True
+            if 'qwen' in self.parser_args.target_model_dir.lower():
+                self.is_qwen = True
             self.model_name = parser_args.model_name
             self.max_tokens = parser_args.max_tokens
             self.temperature = parser_args.temperature
@@ -145,17 +152,29 @@ class DecodingModel(nn.Module):
             target_model_path=None,
             **kwargs,
     ):
+        model_name = 'llama'
         # drafter using the customized model
         if draft_model_path is not None:
-            model = KVLlamaForCausalLM.from_pretrained(
-                draft_model_path, **kwargs
-            ).eval()
+            if 'llama' in draft_model_path.lower():
+                print(f" load llama model")
+                model = KVLlamaForCausalLM.from_pretrained(
+                    draft_model_path, **kwargs
+                ).eval()
+            if 'qwen' in draft_model_path.lower():
+                model_name = 'qwen'
+                print(f" load qwen model")
+                model = KVQwen2ForCausalLM.from_pretrained(
+                    draft_model_path, **kwargs
+                ).eval()
+
         # target model using the class from transformers lib on huggingface
         elif target_model_path is not None:
             model = AutoModelForCausalLM.from_pretrained(target_model_path,
                                                          **kwargs).eval()
         # cls() 调用 MyClass 的 __init__ 方法创建了一个新实例
-        return cls(model, draft_model_path, device=main_device)
+        ret = cls(model, draft_model_path, device=main_device)
+        ret.model_name = model_name
+        return ret
 
     def color_print(self, content: str, color_number: int = 4):
         """print content with color. Some color numbers are listed: Gray: 0, Red: 1, Green: 2, Yellow: 3, Blue: 4."""
@@ -312,6 +331,104 @@ class DecodingModel(nn.Module):
 
     # draft 是一个不断进行树状起草的函数，采用预先分配的kv cache 进行起草工作
     @torch.no_grad()
+    def draft_single_card_test_qwen(self,
+                               input_ids: torch.Tensor,
+                               nodes_per_layer: int = 20,
+                               max_depth: int = 50,
+                               ):
+        assert input_ids.shape[0] == 1, "Only support batch size 1 for now!"
+        # Avoid modifying the input_ids in-place
+        input_ids = input_ids.clone()
+        # Initialize the past key and value states
+        if hasattr(self, "past_key_values"):
+            past_key_values = self.past_key_values
+            past_key_values_data = self.past_key_values_data_list
+            current_length_data = self.current_length_data
+            # Reset the past key and value states
+            current_length_data.zero_()
+        else:
+            (
+                past_key_values,
+                past_key_values_data,
+                current_length_data,
+            ) = initialize_past_key_values(self.model)
+            self.past_key_values = past_key_values
+            self.past_key_values_data_list = past_key_values_data
+            self.current_length_data = current_length_data
+
+        input_len = input_ids.shape[1]
+        tree_attention_mask = None
+        print(self.tokenizer.decode(input_ids[0]))
+
+        # prefill 阶段
+        outputs = self.model(
+            input_ids=input_ids,
+            # attention_mask=tree_attention_mask,
+            past_key_values=past_key_values,
+            cache_position=None,
+            use_cache=False,
+        )
+        # init_len用于制作掩码
+        init_len = input_ids.shape[1]
+        self.verified_len = init_len
+        verified_len_posi = init_len - 1
+
+        # 设置树所在的设备
+        tree = Tree(verified_len_posi, outputs[0].device, nodes_per_layer=nodes_per_layer, max_depth=max_depth)
+        # cache_manager = CacheManager(world_size=self.world_size,rank=self.rank,device=tree.device,tree=tree,is_drafter=True)
+        # decode 阶段，在 decode 阶段，只要没有被完全拒绝，每一次都要处理一层的树节点。
+        # 通过 Tree 类进行管理
+        debug_queue = []
+
+        input_ids, position_ids, tree_attention_mask, parents = tree.enqueue(
+            torch.softmax(outputs[0], dim=-1, dtype=torch.float32))
+        # position_ids = position_ids.unsqueeze(0)
+        tree_attention_mask = self.process_tree_mask(tree_attention_mask, init_len)
+        # drafter decoding
+        j = 0
+        start_time = time.perf_counter()
+        while True:
+            # if self.tokenizer.eos_token_id == input_ids:
+            #     break
+            # input_ids = input_ids.unsqueeze(0).unsqueeze(0)
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=tree_attention_mask,
+                past_key_values=past_key_values,
+                cache_position=position_ids,
+            )
+            # 测试回滚效果
+            if tree.size >= 2:
+                tokens, index = tree.pick_path_for_test()
+                tensor1 = torch.tensor(len(index), device='cuda').unsqueeze(0)
+                tensor2 = torch.tensor(0, device='cuda').unsqueeze(0)
+                tensor3 = torch.tensor(index, device='cuda')
+                buffer = torch.cat([tensor1, tensor2, tensor3], dim=-1)
+                outputs = self._verified_update(tree,
+                                                buffer,
+                                                outputs)
+
+                debug_queue.extend(tokens)
+
+            # outputs[0]： 表示的是 logits
+            # 第一次推理节点的维度为 size(1,23,32000)
+            # size(batch_size, seq_len, vocab_size)
+            # 可以根据 seq_len 来判断当前处理情况是一层树，还是只是正常推理
+            input_ids, position_ids, tree_attention_mask, parents = tree.enqueue(
+                torch.softmax(outputs[0], dim=-1, dtype=torch.float32))
+            # position_ids = position_ids.unsqueeze(0)
+            tree_attention_mask = self.process_tree_mask(tree_attention_mask, self.verified_len)
+
+            # candidates_id.append(input_ids[0][1].item())
+            # print(self.tokenizer.decode(input_ids[0]))
+            print(f"the best candidates are \n{self.tokenizer.decode(debug_queue)}")
+            print(f"the token_ids are {debug_queue}")
+            print(f"the total len is {len(debug_queue)}")
+            print(f"{j}..{(time.perf_counter() - start_time)}............")
+            j += 1
+
+    # draft 是一个不断进行树状起草的函数，采用预先分配的kv cache 进行起草工作
+    @torch.no_grad()
     def draft(self,
               input_ids: torch.Tensor,
               nodes_per_layer: int = 20,
@@ -342,13 +459,19 @@ class DecodingModel(nn.Module):
         print(self.tokenizer.decode(input_ids[0]))
 
         # prefill 阶段
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=None,
-            tree_attention_mask=tree_attention_mask,
-            past_key_values=past_key_values,
-            position_ids=None,
-        )
+        if self.is_llama:
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=None,
+                tree_attention_mask=tree_attention_mask,
+                past_key_values=past_key_values,
+                position_ids=None,
+            )
+        if self.is_qwen:
+            outputs = self.model(
+                input_ids=input_ids,
+                past_key_values=past_key_values,
+            )
         # init_len用于制作掩码
         init_len = input_ids.shape[1]
         self.verified_len = init_len
@@ -367,13 +490,21 @@ class DecodingModel(nn.Module):
             # if self.tokenizer.eos_token_id == input_ids:
             #     break
             # input_ids = input_ids.unsqueeze(0).unsqueeze(0)
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=None,
-                tree_attention_mask=tree_attention_mask,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
-            )
+            if self.is_llama:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=None,
+                    tree_attention_mask=tree_attention_mask,
+                    past_key_values=past_key_values,
+                    position_ids=position_ids,
+                )
+            if self.is_qwen:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=tree_attention_mask,
+                    past_key_values=past_key_values,
+                    cache_position=position_ids,
+                )
 
 
             if cache_manager.is_update:
@@ -530,8 +661,7 @@ class DecodingModel(nn.Module):
                          outputs) -> torch.Tensor:
         # 规定 在 tensor 第一个位置为标志位
         # 标志位 index[0] > 0:index[0]为验证序列长度
-        # 标志位 index[1] == -1 ： 序列被拒绝， 注意，当序列被拒绝不一定长度为1
-        # 标志位 index[1] 为 被拒绝后的 token_id
+        # 标志位 index[1] != 0 ： 序列被拒绝， 注意，当序列被拒绝不一定长度为1 且该值为 拒绝后的token_id
         color_print(f"correct_ids_index_path is {correct_ids_index_path}",3)
         length = int(correct_ids_index_path[0].item())
         flag = int(correct_ids_index_path[1].item())
@@ -545,10 +675,7 @@ class DecodingModel(nn.Module):
             color_print(f"被拒绝后进行推理的 tokenid is{input_id}",3)
             outputs = self.model(
                 input_ids=input_id,
-                attention_mask=None,
-                tree_attention_mask=None,
                 past_key_values=self.past_key_values,
-                position_ids=None,
             )
             # 此时verified_update 在tree会跳过一层layer
             tree.verified_update(correct_ids_index_path, is_reject=True)
@@ -570,13 +697,20 @@ class DecodingModel(nn.Module):
             # I don't send message I will change the communication method
             # 4. decode once and get output
             tree_attention_mask = self.process_tree_mask(tree_attention_mask, self.verified_len)
-            outputs = self.model(
-                input_ids=input_ids,
-                tree_attention_mask=tree_attention_mask,
-                past_key_values=self.past_key_values,
-                position_ids=position_ids,
-            )
-
+            if self.is_llama:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    tree_attention_mask=tree_attention_mask,
+                    past_key_values=self.past_key_values,
+                    position_ids=position_ids,
+                )
+            if self.is_qwen:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=tree_attention_mask,
+                    past_key_values=self.past_key_values,
+                    cache_position=position_ids,
+                )
 
             color_print("divergence")
         return outputs
