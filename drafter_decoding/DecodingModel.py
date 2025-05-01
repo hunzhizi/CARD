@@ -56,8 +56,7 @@ class DecodingModel(nn.Module):
             elif parser_args.eval_mode == "three_model":
                 pass
             elif parser_args.eval_mode == "single_model":
-                # self._init_single_model_config()
-                pass
+                self._init_single_model_config()
             # load_model
             self._load_model()
             # self.inference_data = InferenceData(self.rank)
@@ -100,12 +99,16 @@ class DecodingModel(nn.Module):
             self.device = torch.device(f"cuda:{self.local_rank}")
             self.is_target_model = True
 
+    def _init_single_model_config(self) -> None:
+        color_print(f" single model running...")
+        self.is_target_model = True
+        self.device = torch.device(f"cuda:0")
 
     def _load_model(self):
+        torch.set_grad_enabled(False)
         if self.eval_mode == "two_model":
             print(f"进程 {self.local_rank} 的本地设备: {self.device}")
             # 所有模型仅用于推理，禁用梯度
-            torch.set_grad_enabled(False)
             if self.is_drafter:
                 color_print(f"{self.device} Loading models:{self.parser_args.draft_models_dir[self.local_rank]}\n",
                                  self.rank)
@@ -140,6 +143,14 @@ class DecodingModel(nn.Module):
                     trust_remote_code=True,
                 ).eval()
                 # print(self.model)
+        if self.eval_mode == "single_model":
+            color_print(f"loading model from {self.parser_args.target_model_dir}")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.parser_args.target_model_dir,
+                device_map="auto",
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+            ).eval()
 
     def get_tokenizer(self):
         return self.tokenizer
@@ -172,7 +183,7 @@ class DecodingModel(nn.Module):
             model = AutoModelForCausalLM.from_pretrained(target_model_path,
                                                          **kwargs).eval()
         # cls() 调用 MyClass 的 __init__ 方法创建了一个新实例
-        ret = cls(model, draft_model_path, device=main_device)
+        ret = cls(model, target_model_path, device=main_device)
         ret.model_name = model_name
         return ret
 
@@ -194,43 +205,52 @@ class DecodingModel(nn.Module):
         assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
         # Avoid modifying the input_ids in-place
         input_ids = input_ids.clone()
-        # Initialize the past key and value states
-        if hasattr(self, "past_key_values"):
-            past_key_values = self.past_key_values
-            past_key_values_data = self.past_key_values_data
-            current_length_data = self.current_length_data
-        else:
-            (
-                past_key_values,
-                past_key_values_data,
-                current_length_data,
-            ) = initialize_past_key_values(self.model)
-            self.past_key_values = past_key_values
-            self.past_key_values_data_list = past_key_values_data
-            self.current_length_data = current_length_data
+        # Store the original input to preserve it during generation
+        original_input_length = input_ids.shape[1]
 
-        input_len = input_ids.shape[1]
-        print(self.tokenizer.decode(input_ids[0]))
+        # Set generation parameters
+        temperature = 1.0  # Control randomness (lower = more deterministic)
 
-        # prefill 阶段
-        outputs = self.model(
-            input_ids=input_ids,
-            past_key_values=past_key_values,
-        )
-        input_id = torch.argmax(outputs[0][:, -1, :], dim=-1)
-        input_id = input_id.unsqueeze(0)
-        input_ids = torch.cat([input_ids, input_id], dim=-1)
-        max_length = 500
-        for i in range(max_length):
-            outputs = self.model(
-                input_ids=input_id,
-                past_key_values=past_key_values
-            )
-            input_id = torch.argmax(outputs[0], dim=-1)
-            input_id = input_id
-            input_ids = torch.cat([input_ids, input_id], dim=-1)
-            print(f"output is : {self.tokenizer.decode(input_ids[0])}")
-        return input_ids
+        # Generation loop
+        output_ids = input_ids.clone()
+
+        for _ in range(self.max_tokens):
+            # Get only the most recent context to avoid excessive memory usage
+            # Optional, especially useful for longer generations
+            if output_ids.shape[1] > 1024:  # Example context window size
+                context_ids = output_ids[:, -1024:]
+            else:
+                context_ids = output_ids
+
+            with torch.no_grad():  # No need to track gradients during inference
+                outputs = self.model(context_ids)
+
+            # Get logits for the last token
+            next_token_logits = outputs.logits[:, -1, :]
+
+            # Optional: Apply temperature
+            if temperature != 1.0:
+                next_token_logits = next_token_logits / temperature
+
+            # Get the most likely next token
+            next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)
+
+            # Append the new token to the sequence
+            output_ids = torch.cat([output_ids, next_token.transpose(0, 1)], dim=1)
+
+            # Print the current output (optional - can be removed for performance)
+            current_text = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+            print(f"Generated so far: {current_text}")
+
+            # Stop if we generate an EOS token
+            if next_token.item() == self.tokenizer.eos_token_id:
+                break
+
+        # Get the final generated text
+        generated_text = self.tokenizer.decode(output_ids[0][original_input_length:], skip_special_tokens=True)
+        print(f"\nFinal generated text:\n{generated_text}")
+        sum_tokens = output_ids[0][original_input_length:].shape[0]
+        return output_ids
 
     # draft 是一个不断进行树状起草的函数，采用预先分配的kv cache 进行起草工作
     @torch.no_grad()

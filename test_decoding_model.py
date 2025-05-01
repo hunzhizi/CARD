@@ -20,7 +20,7 @@ draft_model_path = "/mnt/data/zhouShaoRepo/model/llama-68m"
 
 def test_draft_single_card():
     model = DecodingModel.from_pretrained(
-        draft_model_path=base_model_path,
+        target_model_path=base_model_path,
         main_device='cuda',
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
@@ -34,8 +34,8 @@ def test_draft_single_card():
     input_ids = torch.as_tensor(input_ids).cuda()
     model.device = 'cuda'
     # output_ids=model.draft_single_card_test(input_ids,nodes_per_layer=20)
-    output_ids=model.draft_single_card_test_qwen(input_ids,nodes_per_layer=20)
-    # output_ids=model.autoregressive_decoding(input_ids)
+    # output_ids=model.draft_single_card_test_qwen(input_ids,nodes_per_layer=20)
+    output_ids=model.autoregressive_decoding(input_ids)
     output=model.tokenizer.decode(output_ids[0])
 
     print(output)

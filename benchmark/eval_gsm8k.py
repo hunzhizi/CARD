@@ -239,16 +239,21 @@ class EvalGSM8K(DecodingModel):
                 input_ids = datum["input_ids"].to(self.device)
                 print(input_ids)
                 torch.cuda.synchronize()
-                start_time = time.time()
-                if self.is_target_model:
-                    generate_ids = self.decoding_with_cache(input_ids, self.nodes_per_layer, self.max_depth)
-                    # 结束后通知 drafter 结束
-                    end_flag = torch.tensor(-1, device=self.model.device, dtype=torch.int)
-                    dist.send(end_flag, dst=Config.DRAFTER_RANK)
-                if self.is_drafter:
-                    self.draft(input_ids, self.nodes_per_layer, self.max_depth)
+                if self.parser_args.eval_mode == "two_model":
+                    if self.is_target_model:
+                        start_time = time.time()
+                        generate_ids = self.decoding_with_cache(input_ids, self.nodes_per_layer, self.max_depth)
+                        end_time = time.time()
+                        # 结束后通知 drafter 结束
+                        end_flag = torch.tensor(-1, device=self.model.device, dtype=torch.int)
+                        dist.send(end_flag, dst=Config.DRAFTER_RANK)
+                    if self.is_drafter:
+                        self.draft(input_ids, self.nodes_per_layer, self.max_depth)
+                elif self.parser_args.eval_mode == "single_model":
+                    start_time = time.time()
+                    generate_ids = self.autoregressive_decoding(input_ids)
+                    end_time = time.time()
                 torch.cuda.synchronize()
-                end_time = time.time()
                 dist.barrier()
                 if self.is_target_model:
                     answer = self.postprocess(datum["input_text"], self.tokenizer.decode(generate_ids[0, :]))
