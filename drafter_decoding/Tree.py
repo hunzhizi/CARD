@@ -50,7 +50,7 @@ class Tree:
         # 最佳 candidate path
         self.best_candidates:list = list()
         self.chosen_id = -1  # 用于保存当cache全都被命中后的 logits 的选择，或者当被拒绝后重新选择的logits的 id
-        self.root_id = 0 # 用于维护 enqueue 中当 size=0 时 parent_id 未知的情况
+        self.root_id = -1 # 用于维护 enqueue 中当 size=0 时 parent_id 未知的情况
         self.global_condition = threading.Condition()  # 全局条件变量 用于等待
 
 
@@ -78,7 +78,7 @@ class Tree:
             raise RuntimeError(f"buffer_capacity: {self.buffer_capacity} is not enough")
         if self.is_empty():
             # 第一次推理只取最后一个 token的 logits，当被拒绝或者全部接受后更新，选择self.chosen_id 通过这个变量进行维护
-            logits, ids = torch.topk(logits[0][self.chosen_id], k=self.nodes_per_layer, dim=-1)
+            logits, ids = torch.topk(logits[0][self.root_id], k=self.nodes_per_layer, dim=-1)
             self.logits_buffer[self.tail].copy_(logits)
             self.weight_buffer[self.tail].copy_(logits)
             self.input_ids_buffer[self.tail].copy_(ids)
@@ -382,8 +382,7 @@ class Tree:
                 break
             weights = self.weight_buffer[head].clone()
             weights *= mask
-        print(f"tuple is {best_candidate,picked_index,root_index}")
-        print(f"退出 get candidates for target model")
+        print(f"query cache tuple is {best_candidate,picked_index,root_index}")
         return best_candidate,picked_index,root_index
 
 
@@ -404,9 +403,8 @@ class Tree:
         dequeue_num = len(correct_ids_index_path)
         # 更新 verified_pos_len
         self.verified_pos_len += (dequeue_num + 1)
-        self.dequeue(dequeue_num)
-        color_print(f"self.index is {self.input_ids_buffer[(self.head - 1)% self.buffer_capacity]}",2)
         if dequeue_num != 0:
+            self.dequeue(dequeue_num)
             root_index = correct_ids_index_path[-1]
         if self.is_empty():     # todo is return root_index right?
             print(f"torch.tensor(root_index,device=self.device,dtype=torch.int).unsqueeze(0) is {torch.tensor(root_index,device=self.device,dtype=torch.int).unsqueeze(0)}")
@@ -422,12 +420,12 @@ class Tree:
         #         return False
         #     print(f" matches is {matches}")
         #     return matches[0]
-        color_print(f"root index is {root_index}, self.parents_index[self.head] is {self.parents_index[self.head]}",2)
+        # color_print(f"root index is {root_index}, self.parents_index[self.head] is {self.parents_index[self.head]}",2)
         mask = torch.isin(self.parents_index[self.head], root_index)
-        color_print(f"mask is {mask}",2)
+        # color_print(f"mask is {mask}",2)
         new_mask = (mask * self.input_ids_buffer[self.head]) == new_sample_token_id
-        color_print(f"new mask is {new_mask}", 2)
-        color_print(f"self.input_ids_buffer[self.head] is {self.input_ids_buffer[self.head]},new_sample_token_id is {new_sample_token_id}", 2)
+        # color_print(f"new mask is {new_mask}", 2)
+        # color_print(f"self.input_ids_buffer[self.head] is {self.input_ids_buffer[self.head]},new_sample_token_id is {new_sample_token_id}", 2)
         if torch.sum(mask).item() != 0 and torch.any(new_mask):
             # acc
             parent_id:torch.Tensor = torch.where(new_mask)[0]

@@ -57,7 +57,7 @@ def parse_arguments():
     """Specified arguments for running scripts."""
     parser = argparse.ArgumentParser(description='args for this file')
 
-    parser.add_argument('--data_path', type=str, default="./data")
+    parser.add_argument('--data_path', type=str, default="../data")
 
     parser.add_argument('--draft_models', type=str, nargs='+', default=["Llama-3.2-1B-Instruct"])
     parser.add_argument('--target_model', type=str, default="Llama-3.1-8B-Instruct")

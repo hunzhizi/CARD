@@ -540,7 +540,6 @@ class DecodingModel(nn.Module):
             # 可以根据 seq_len 来判断当前处理情况是一层树，还是只是正常推理
             input_ids, position_ids, tree_attention_mask, parents = tree.enqueue(
                 torch.softmax(outputs[0], dim=-1, dtype=torch.float32))
-            color_print(f"drafter send msg to target model ")
             tree_attention_mask = self.process_tree_mask(tree_attention_mask, self.verified_len)
 
 
@@ -558,7 +557,6 @@ class DecodingModel(nn.Module):
         self.verified_len = input_ids.shape[1]
         # create tree ,start recv cache
         tree_buffer = Tree(input_ids.shape[1], self.device, nodes_per_layer, max_depth)
-        # todo init distributed env
 
         cache_manager = CacheManager(self.world_size, self.rank, self.device, tree_buffer, is_target_model=True)
 
@@ -577,17 +575,17 @@ class DecodingModel(nn.Module):
         hit_cache = True
         send_verified_index_buffer = torch.zeros(tree_buffer.buffer_capacity + 2, device=self.device, dtype=torch.int)
         start = time.perf_counter()
-        max_length = 100
+        max_length = 500
         for i in range(max_length):
             if hit_cache is False:
                 # 被拒绝重新请求 cache
-                color_print(f"hit_cache is {hit_cache}", self.rank)
+                # color_print(f"hit_cache is {hit_cache}", self.rank)
                 dist.send(query_flag, dst=Config.DRAFTER_RANK)
                 cache_manager.recv_buffer_for_target_model()
                 cache_manager.update_cache_for_target_model()
             # 1. query cache
             best_candidates, picked_index, root_index = cache_manager.query_cache()
-            color_print(f"tree size 大小为{tree_buffer.size}\ntarget model 查询cache 结果为best_candidates, picked_index, root_index:{best_candidates, picked_index, root_index}",self.rank)
+            # color_print(f"tree size 大小为{tree_buffer.size}\ntarget model 查询cache 结果为best_candidates, picked_index, root_index:{best_candidates, picked_index, root_index}",self.rank)
             best_candidates = torch.tensor(best_candidates, device=self.device, dtype=torch.int).unsqueeze(0)
             # 2. decode with cache
             if model._past_key_values is None:
@@ -596,14 +594,14 @@ class DecodingModel(nn.Module):
                 best_candidates = torch.cat([new_sample_token.unsqueeze(0),best_candidates],dim=-1)
             token_ids = model.generate(best_candidates)
 
-            color_print(f"target model 生成 token_ids:{token_ids}",self.rank)
+            # color_print(f"target model 生成 token_ids:{token_ids}",self.rank)
             cache_manager.recv_buffer_for_target_model()
             # [debug]
             # 1d token_ids
             # 保存输出
             output_token_ids = torch.cat([output_token_ids, token_ids.unsqueeze(0)], dim=-1)
             # color_print(f"len is {output_token_ids.shape[1]}output_token_ids is {output_token_ids}",self.rank)
-            color_print(self.tokenizer.decode(output_token_ids[0]),5)
+            # color_print(self.tokenizer.decode(output_token_ids[0]),5)
             # tokens_ids is 1-d tensor
             # 3. check if all verified tokens in cache
             # let me clear: what is accept and reject?
@@ -615,7 +613,7 @@ class DecodingModel(nn.Module):
             hit_cache = cache_manager.update_tree_buffer(correct_ids_index_path, new_sample_token,
                                                          root_index=root_index)
             correct_ids_index_path = torch.tensor(correct_ids_index_path,device=self.device)
-            color_print(f"correct_ids_index_path is {correct_ids_index_path}",self.rank)
+            # color_print(f"correct_ids_index_path is {correct_ids_index_path}",self.rank)
             # hit_cache 如果不为 false 则其为 一个 tensor 里面表示 new_token_idx
             if hit_cache is not False:
                 # 命中cache
@@ -629,11 +627,11 @@ class DecodingModel(nn.Module):
                 # index[1] 被拒绝后的token
                 #   3.2 reject  (could not find a path in cache)
                 seq_len = torch.tensor(correct_ids_index_path.shape[0], device=self.device).unsqueeze(0)
-                color_print(f"seq_len, new_sample_token, correct_ids_index_path is {seq_len, new_sample_token, correct_ids_index_path}",self.rank)
+                # color_print(f"seq_len, new_sample_token, correct_ids_index_path is {seq_len, new_sample_token, correct_ids_index_path}",self.rank)
                 send_msg = torch.cat([seq_len, new_sample_token, correct_ids_index_path], dim=-1).to(torch.int)
 
             # 4. isend message including index info to drafter
-            color_print(f"target model send_msg is {send_msg}",self.rank)
+            # color_print(f"target model send_msg is {send_msg}",self.rank)
             send_verified_index_buffer[0:send_msg.shape[0]].copy_(send_msg)
             # dist.send(send_msg, dst=Config.DRAFTER_RANK)
             dist.send(send_verified_index_buffer, dst=Config.DRAFTER_RANK)
@@ -678,7 +676,7 @@ class DecodingModel(nn.Module):
         hit_cache = True
         send_verified_index_buffer = torch.zeros(tree_buffer.buffer_capacity + 2, device=self.device, dtype=torch.int)
         start = time.perf_counter()
-        max_length = 3900
+        max_length = 1000
         while output_token_ids.shape[1] < max_length:
             if hit_cache is False:
                 # 被拒绝重新请求 cache
@@ -796,12 +794,12 @@ class DecodingModel(nn.Module):
         flag = int(correct_ids_index_path[1].item())
         # 正确的 token ids  index 序列
         correct_ids_index_path = correct_ids_index_path[2:length + 2]
-        if not hasattr(self, "drafter_profile_list"):
-            self.drafter_profile_list = list()
-        self.drafter_profile_list.extend(tree.pick_path_for_profile(correct_ids_index_path))
-        if flag != -1:
-            self.drafter_profile_list.append(flag)
-        color_print(f"drafter verified tokens are {self.tokenizer.decode(self.drafter_profile_list)}",5)
+        # if not hasattr(self, "drafter_profile_list"):
+        #     self.drafter_profile_list = list()
+        # self.drafter_profile_list.extend(tree.pick_path_for_profile(correct_ids_index_path))
+        # if flag != -1:
+        #     self.drafter_profile_list.append(flag)
+        # color_print(f"drafter verified tokens are {self.tokenizer.decode(self.drafter_profile_list)}",5)
 
         if flag != -1:
             # 先回滚，然后携带正确 token 正常推理一次，更新树

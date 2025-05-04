@@ -63,9 +63,9 @@ class CacheManager:
                     # 置更改标志位为 True
                     while True:
                         # 首先进行握手通知线程进行信息拉去
-                        color_print(f"_get_recv_thread 准备get recv msg {self.handshake_flag}")
+                        # color_print(f"_get_recv_thread 准备get recv msg {self.handshake_flag}")
                         dist.recv(self.handshake_flag, src=Config.TARGET_MODEL_RANK)
-                        color_print(f"_get_recv_thread get recv msg {self.handshake_flag}")
+                        # color_print(f"_get_recv_thread get recv msg {self.handshake_flag}")
                         if self.handshake_flag == -1:
                             self.is_decoding = False
                             return
@@ -74,22 +74,22 @@ class CacheManager:
                         # handshake_flag == 1 表示 握手通讯
                         # todo with lock
                         if self.tree_buffer.size >= Config.PREDICTION_NUM and self.is_update == False:
-                            color_print(f"_get_recv_thread 准备 send tree buffer state")
+                            # color_print(f"_get_recv_thread 准备 send tree buffer state")
                             send_msg = self.tree_buffer.get_send_msg_for_drafter()
                             dist.send(self.tree_buffer.get_send_msg_for_drafter(), Config.TARGET_MODEL_RANK)
                             # color_print(f"_get_recv_thread send tree buffer state {send_msg}")
                         else:
-                            color_print(f"_get_recv_thread 获取锁")
+                            # color_print(f"_get_recv_thread 获取锁")
                             with self.tree_buffer.global_condition:
                                 self.tree_buffer.global_condition.wait()
-                                color_print(f"_get_recv_thread 准备 send tree buffer state")
+                                # color_print(f"_get_recv_thread 准备 send tree buffer state")
                                 send_msg = self.tree_buffer.get_send_msg_for_drafter()
                                 dist.send(self.tree_buffer.get_send_msg_for_drafter(), Config.TARGET_MODEL_RANK)
                             # color_print(f"_get_recv_thread send tree buffer state {send_msg}")
                         if self.handshake_flag == 0:
                             continue
                         else:
-                            color_print(f"handshake_flag is {self.handshake_flag}, 准备 recv msg from target model")
+                            # color_print(f"handshake_flag is {self.handshake_flag}, 准备 recv msg from target model")
                             dist.recv(self.recv_buffer, src=Config.TARGET_MODEL_RANK)
                             with self.lock:
                                 self.is_update = True  # 可能有线程安全， 但是概率极低
@@ -106,7 +106,7 @@ class CacheManager:
             pass
             return None
         elif self.is_calibration:
-            pass
+            return None
         elif self.is_target_model:
             # 目标模型需要
             # 1. 接收 每一层的树
@@ -134,7 +134,8 @@ class CacheManager:
 
             # elif self.world_size == 3:
             #     pass
-            pass
+            return None
+        return None
 
     def recv_buffer_for_target_model(self):
         self.work = dist.irecv(self.combination_buffer,src=Config.DRAFTER_RANK)

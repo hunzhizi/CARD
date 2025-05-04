@@ -31,6 +31,7 @@ def prepare_logits_processor(
         if top_k > 0:
             processor_list.append(TopKLogitsWarper(top_k))
         return processor_list
+    return None
 
 
 class KVCacheModel(nn.Module):
@@ -66,11 +67,10 @@ class KVCacheModel(nn.Module):
             tokens_id = self._generate_some_tokens_with_kvcache(input_ids,True)
         else:
             tokens_id = self._generate_some_tokens_with_kvcache(input_ids)
-        # todo needs test
         return tokens_id
 
     def compare_tensors(self, tensor1, tensor2):
-        print(f" tensor2 is {tensor2}, tensor1 is {tensor1}")
+        # print(f" tensor2 is {tensor2}, tensor1 is {tensor1}")
         assert len(tensor2) == len(tensor1) + 1, "tensor2的长度必须比tensor1大1"
         length = len(tensor1)
         # 直接比较前length个元素，生成差异掩码
@@ -111,7 +111,6 @@ class KVCacheModel(nn.Module):
             for k, v in self._past_key_values
         ]
         self.current_verified_len = end_pos
-        print(f"self._past_key_values[0][0].shape[2] is {self._past_key_values[0][0].shape[2]}")
 
     def _forward_with_kvcache(self, input_ids: torch.Tensor) -> torch.FloatTensor:
         # 第一次推理没有保存kvcache ，此时调用forward
