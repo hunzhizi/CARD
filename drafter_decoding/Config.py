@@ -4,7 +4,7 @@ class Config:
     DRAFTER_RANK = 0
     _heng_yuan_yun = "/hy-tmp"
     _3090ti = "/mnt/data/zhouShaoRepo/model"
-    MODEL_DIR = _3090ti
+    MODEL_DIR = _heng_yuan_yun
     PREDICTION_NUM = 1
 
 if __name__ == '__main__':

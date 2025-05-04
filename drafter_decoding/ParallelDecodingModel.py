@@ -21,7 +21,7 @@ class ParallelDecodingModel(DecodingModel):
                 add_special_tokens=encode_special_token_flag)
             input_ids = torch.tensor(input_ids).unsqueeze(0).to(self.device)
             if self.is_target_model:
-                self.decoding_with_cache(input_ids,self.nodes_per_layer, self.max_depth)
+                self.decoding_with_cache_profile(input_ids,self.nodes_per_layer, self.max_depth)
                 # 结束后通知 drafter 结束
                 end_flag = torch.tensor(-1, device=self.model.device, dtype=torch.int)
                 dist.send(end_flag, dst=Config.DRAFTER_RANK)

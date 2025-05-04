@@ -11,9 +11,9 @@ from drafter_decoding.modeling_llama_kv import LlamaForCausalLM as KVLlamaForCau
 # base_model_path = "/mnt/data/zhouShaoRepo/EAGLE/eagle/model_weight/base_model"
 # base_model_path = "/mnt/data/zhouShaoRepo/model/Llama-3.1-8B-Instruct"
 # base_model_path = "/hy-tmp/Llama-3.1-8B-Instruct"
-# base_model_path = "/hy-tmp/Llama-3.2-1B-Instruct"
+base_model_path = "/hy-tmp/Llama-3.2-1B-Instruct"
 # base_model_path = "/mnt/data/zhouShaoRepo/model/Qwen2.5-7B-Instruct"
-base_model_path = "/home/ps/.cache/huggingface/hub/models--qwen--qwen2.5-3b-instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1"
+# base_model_path = "/home/ps/.cache/huggingface/hub/models--qwen--qwen2.5-3b-instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1"
 draft_model_path = "/mnt/data/zhouShaoRepo/model/llama-68m"
 
 
@@ -31,6 +31,7 @@ def test_draft_single_card():
     your_message = "Hello, tell me a story about a man who lost his way in the forest and found a treasure."
     # your_message="tell me a story about Little bear."
     input_ids = model.tokenizer([your_message]).input_ids
+    print(f"model.tokenizer.decode([0]) is {model.tokenizer.decode([0])}")
     input_ids = torch.as_tensor(input_ids).cuda()
     model.device = 'cuda'
     # output_ids=model.draft_single_card_test(input_ids,nodes_per_layer=20)
