@@ -77,7 +77,7 @@ class CacheManager:
                             color_print(f"_get_recv_thread 准备 send tree buffer state")
                             send_msg = self.tree_buffer.get_send_msg_for_drafter()
                             dist.send(self.tree_buffer.get_send_msg_for_drafter(), Config.TARGET_MODEL_RANK)
-                            color_print(f"_get_recv_thread send tree buffer state {send_msg}")
+                            # color_print(f"_get_recv_thread send tree buffer state {send_msg}")
                         else:
                             color_print(f"_get_recv_thread 获取锁")
                             with self.tree_buffer.global_condition:
@@ -85,14 +85,14 @@ class CacheManager:
                                 color_print(f"_get_recv_thread 准备 send tree buffer state")
                                 send_msg = self.tree_buffer.get_send_msg_for_drafter()
                                 dist.send(self.tree_buffer.get_send_msg_for_drafter(), Config.TARGET_MODEL_RANK)
-                            color_print(f"_get_recv_thread send tree buffer state {send_msg}")
+                            # color_print(f"_get_recv_thread send tree buffer state {send_msg}")
                         if self.handshake_flag == 0:
-                            color_print(f"handshake_flag is {self.handshake_flag}")
                             continue
                         else:
                             color_print(f"handshake_flag is {self.handshake_flag}, 准备 recv msg from target model")
                             dist.recv(self.recv_buffer, src=Config.TARGET_MODEL_RANK)
-                            self.is_update = True  # 可能有线程安全， 但是概率极低
+                            with self.lock:
+                                self.is_update = True  # 可能有线程安全， 但是概率极低
                             color_print(f" recv msg from target model\n recv_buffer is {self.recv_buffer}")
 
                 thread = threading.Thread(
@@ -141,7 +141,6 @@ class CacheManager:
 
     def update_cache_for_target_model(self):
         self.work.wait()
-        print(f"target model 接收到 来自 drafter 的 tree state {self.combination_buffer}")
         self.tree_buffer.update_cache_for_target_model(self.combination_buffer)
 
     def query_cache(self):
