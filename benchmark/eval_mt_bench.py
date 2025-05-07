@@ -116,16 +116,22 @@ class EvalMTBench(DecodingModel):
                         prompt = conv.get_prompt() + " "
                         input_ids = torch.tensor(self.tokenizer.encode(prompt)).unsqueeze(0).to(self.device)
                     torch.cuda.synchronize()
-                    start_time = time.time()
-                    if self.is_target_model:
-                        output_ids = self.decoding_with_cache(input_ids, self.nodes_per_layer, self.max_depth)
-                        # 结束后通知 drafter 结束
-                        end_flag = torch.tensor(-1, device=self.model.device, dtype=torch.int)
-                        dist.send(end_flag, dst=Config.DRAFTER_RANK)
-                    if self.is_drafter:
-                        self.draft(input_ids, self.nodes_per_layer, self.max_depth)
+                    if self.parser_args.eval_mode == "two_model":
+                        if self.is_target_model:
+                            start_time = time.time()
+                            output_ids = self.decoding_with_cache(input_ids, self.nodes_per_layer,
+                                                                            self.max_depth)
+                            end_time = time.time()
+                            # 结束后通知 drafter 结束
+                            end_flag = torch.tensor(-1, device=self.model.device, dtype=torch.int)
+                            dist.send(end_flag, dst=Config.DRAFTER_RANK)
+                        if self.is_drafter:
+                            self.draft(input_ids, self.nodes_per_layer, self.max_depth)
+                    elif self.parser_args.eval_mode == "single_model":
+                        start_time = time.time()
+                        output_ids = self.autoregressive_decoding(input_ids)
+                        end_time = time.time()
                     torch.cuda.synchronize()
-                    end_time = time.time()
                     dist.barrier()
                     if self.is_target_model:
                         output_text = self.tokenizer.decode(output_ids[0], spaces_between_special_tokens=False)

@@ -1,4 +1,5 @@
 import threading
+import time
 from threading import Thread
 
 import torch
@@ -63,10 +64,16 @@ class CacheManager:
                     # 置更改标志位为 True
                     while True:
                         # 首先进行握手通知线程进行信息拉去
-                        # color_print(f"_get_recv_thread 准备get recv msg {self.handshake_flag}")
-                        dist.recv(self.handshake_flag, src=Config.TARGET_MODEL_RANK)
-                        # color_print(f"_get_recv_thread get recv msg {self.handshake_flag}")
-                        if self.handshake_flag == -1:
+                        color_print(f"_get_recv_thread 准备get recv msg {self.handshake_flag}")
+                        # dist.recv(self.handshake_flag, src=Config.TARGET_MODEL_RANK)
+                        work = dist.irecv(self.handshake_flag, src=Config.TARGET_MODEL_RANK)
+                        while not work.is_completed():
+                            time.sleep(0.0005)
+                        # work = dist.irecv(self.handshake_flag, src=Config.TARGET_MODEL_RANK)
+                        # work.wait()  # 阻塞等待，直到接收完成，比 time.sleep() 高效
+                        handshake_val = self.handshake_flag.item()  # 获取 tensor 的值
+                        color_print(f"_get_recv_thread get recv msg {self.handshake_flag}")
+                        if handshake_val == -1:
                             self.is_decoding = False
                             return
                         # handshake_flag == 0 表示 单纯拉取 target model 第一次进行query cache 此时没有验证信息，只需要拉去cache,
@@ -74,25 +81,33 @@ class CacheManager:
                         # handshake_flag == 1 表示 握手通讯
                         # todo with lock
                         if self.tree_buffer.size >= Config.PREDICTION_NUM and self.is_update == False:
-                            # color_print(f"_get_recv_thread 准备 send tree buffer state")
+                            color_print(f"_get_recv_thread 准备 send tree buffer state")
                             send_msg = self.tree_buffer.get_send_msg_for_drafter()
                             dist.send(self.tree_buffer.get_send_msg_for_drafter(), Config.TARGET_MODEL_RANK)
-                            # color_print(f"_get_recv_thread send tree buffer state {send_msg}")
+                            color_print(f"_get_recv_thread send tree buffer state {send_msg}")
                         else:
-                            # color_print(f"_get_recv_thread 获取锁")
+                            color_print(f"_get_recv_thread 获取锁")
                             with self.tree_buffer.global_condition:
                                 self.tree_buffer.global_condition.wait()
-                                # color_print(f"_get_recv_thread 准备 send tree buffer state")
-                                send_msg = self.tree_buffer.get_send_msg_for_drafter()
-                                dist.send(self.tree_buffer.get_send_msg_for_drafter(), Config.TARGET_MODEL_RANK)
-                            # color_print(f"_get_recv_thread send tree buffer state {send_msg}")
-                        if self.handshake_flag == 0:
+                                color_print(f"_get_recv_thread 准备 send tree buffer state")
+                                # send_msg = self.tree_buffer.get_send_msg_for_drafter()
+                                work = dist.isend(self.tree_buffer.get_send_msg_for_drafter(), Config.TARGET_MODEL_RANK)
+                                while not work.is_completed():
+                                    # print("未获取锁")
+                                    time.sleep(0.001)
+                            color_print(f"_get_recv_thread send tree buffer state {send_msg}")
+                        if handshake_val == 0:
                             continue
                         else:
-                            # color_print(f"handshake_flag is {self.handshake_flag}, 准备 recv msg from target model")
-                            dist.recv(self.recv_buffer, src=Config.TARGET_MODEL_RANK)
+                            color_print(f"handshake_flag is {handshake_val}, 准备 recv msg from target model")
+                            work = dist.irecv(self.recv_buffer, src=Config.TARGET_MODEL_RANK)
+                            while not work.is_completed():
+                                # print("未获取锁")
+                                time.sleep(0.001)
+                            color_print(f"获取 self.lock 进行self.is_update 的修改")
                             with self.lock:
                                 self.is_update = True  # 可能有线程安全， 但是概率极低
+                            color_print(f"获取 self.lock 进行self.is_update 修改成功")
                             color_print(f" recv msg from target model\n recv_buffer is {self.recv_buffer}")
 
                 thread = threading.Thread(

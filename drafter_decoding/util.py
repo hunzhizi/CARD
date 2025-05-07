@@ -150,6 +150,7 @@ class InferenceData:
         all_acc_tokens = [i + 1 for i in self.acc_len_list]
         generate_tokens_num = sum(all_acc_tokens)
         self.forward_times = len(all_acc_tokens)
+        print(f"all_acc_tokens are {all_acc_tokens}")
         mean_acc_len = generate_tokens_num/len(all_acc_tokens)
         return generate_tokens_num/self.exe_time, mean_acc_len
 

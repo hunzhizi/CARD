@@ -10,8 +10,8 @@ from drafter_decoding.modeling_llama_kv import LlamaForCausalLM as KVLlamaForCau
 
 # base_model_path = "/mnt/data/zhouShaoRepo/EAGLE/eagle/model_weight/base_model"
 # base_model_path = "/mnt/data/zhouShaoRepo/model/Llama-3.1-8B-Instruct"
-# base_model_path = "/hy-tmp/Llama-3.1-8B-Instruct"
-base_model_path = "/hy-tmp/Llama-3.2-1B-Instruct"
+base_model_path = "/hy-tmp/Llama-3.1-8B-Instruct"
+# base_model_path = "/hy-tmp/Llama-3.2-1B-Instruct"
 # base_model_path = "/mnt/data/zhouShaoRepo/model/Qwen2.5-7B-Instruct"
 # base_model_path = "/home/ps/.cache/huggingface/hub/models--qwen--qwen2.5-3b-instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1"
 draft_model_path = "/mnt/data/zhouShaoRepo/model/llama-68m"
@@ -28,8 +28,8 @@ def test_draft_single_card():
     )
     model.eval()
 
-    your_message = "Hello, tell me a story about a man who lost his way in the forest and found a treasure."
-    # your_message="tell me a story about Little bear."
+    # your_message = "Hello, tell me a story about a man who lost his way in the forest and found a treasure."
+    your_message="tell me a story about Little bear."
     input_ids = model.tokenizer([your_message]).input_ids
     print(f"model.tokenizer.decode([0]) is {model.tokenizer.decode([0])}")
     input_ids = torch.as_tensor(input_ids).cuda()
@@ -73,7 +73,7 @@ def test_autoregressive_decoding():
     original_input_length = input_ids.shape[1]
 
     # Set generation parameters
-    max_new_tokens = 600  # Maximum number of tokens to generate
+    max_new_tokens = 500  # Maximum number of tokens to generate
     temperature = 1.0  # Control randomness (lower = more deterministic)
 
     # Generation loop
@@ -154,10 +154,10 @@ def test_qwen():
 
 
 if __name__ == '__main__':
-    # start = time.perf_counter()
-    # output_ids, generated_text,sum_tokens = test_autoregressive_decoding()
-    # gap = time.perf_counter() - start
-    # print(f"执行时间 is {gap},生成 tokens{sum_tokens}, tokens/s = { sum_tokens/gap}")
-    test_draft_single_card()
+    start = time.perf_counter()
+    output_ids, generated_text,sum_tokens = test_autoregressive_decoding()
+    gap = time.perf_counter() - start
+    print(f"执行时间 is {gap},生成 tokens{sum_tokens}, tokens/s = { sum_tokens/gap}")
+    # test_draft_single_card()
     # test_qwen()
 

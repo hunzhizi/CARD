@@ -1,3 +1,4 @@
+import time
 from typing import Tuple
 
 import torch
@@ -70,7 +71,6 @@ class KVCacheModel(nn.Module):
         return tokens_id
 
     def compare_tensors(self, tensor1, tensor2):
-        # print(f" tensor2 is {tensor2}, tensor1 is {tensor1}")
         assert len(tensor2) == len(tensor1) + 1, "tensor2的长度必须比tensor1大1"
         length = len(tensor1)
         # 直接比较前length个元素，生成差异掩码
@@ -115,7 +115,6 @@ class KVCacheModel(nn.Module):
     def _forward_with_kvcache(self, input_ids: torch.Tensor) -> torch.FloatTensor:
         # 第一次推理没有保存kvcache ，此时调用forward
         if self._past_key_values is None:
-            # print(f"input_ids are {input_ids}")
             outputs = self._model(input_ids)
             # send msg to get tree info asynchronously
             # 这里其实不太符合开闭原则,但是为了 asynchronously 最好是在这里进行tree info 的获取
@@ -141,14 +140,19 @@ class KVCacheModel(nn.Module):
                 new_input_id = torch.unsqueeze(new_input_id, 0)
 
             # 进行推理，传入当前 token_id 和 past_key_values ,使用use_cache 进行推理
-            # print(f"target model self._model \n input_ids is {new_input_id}")
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
             outputs = self._model(input_ids=new_input_id,
                                   past_key_values=self._past_key_values,
                                   use_cache=True)
+            end_event.record()
+            torch.cuda.synchronize()
+            self.sum += start_event.elapsed_time(end_event) / 1000
+            print(f"generate time is {self.sum}")
             # send msg to get tree info asynchronously
             # 这里其实不太符合开闭原则,但是为了 asynchronously 最好是在这里进行tree info 的获取
             dist.isend(self.handshake_flag,dst=Config.DRAFTER_RANK)
-
             logits = outputs.logits
 
             if logits.dim() == 2:

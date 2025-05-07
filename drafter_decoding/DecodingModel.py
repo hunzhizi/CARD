@@ -146,9 +146,22 @@ class DecodingModel(nn.Module):
                 # print(self.model)
         if self.eval_mode == "single_model":
             color_print(f"loading model from {self.parser_args.target_model_dir}")
+            device_map = {"": self.device}
+            if self.cuda_device_count == 3:
+                config = AutoConfig.from_pretrained(self.parser_args.target_model_dir)
+                num_layers = config.num_hidden_layers
+                split_point = num_layers // 2 + 1
+                device_map = {
+                    "model.embed_tokens": "cuda:1",
+                    **{f"model.layers.{i}": "cuda:1" for i in range(0, split_point)},
+                    **{f"model.layers.{i}": "cuda:2" for i in range(split_point, num_layers)},
+                    "model.norm": "cuda:2",
+                    "model.rotary_emb": "cuda:2",
+                    "lm_head": "cuda:2",
+                }
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.parser_args.target_model_dir,
-                device_map="auto",
+                device_map=device_map,
                 torch_dtype=torch.float16,
                 trust_remote_code=True,
             ).eval()
@@ -201,57 +214,78 @@ class DecodingModel(nn.Module):
         attention_mask = attention_mask[None, None, :, :]
         return attention_mask
 
+    @torch.no_grad()
     def autoregressive_decoding(self,
                               input_ids: torch.Tensor) -> torch.Tensor:
         assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
-        # Avoid modifying the input_ids in-place
-        input_ids = input_ids.clone()
-        # Store the original input to preserve it during generation
-        original_input_length = input_ids.shape[1]
+        # 将输入移动到与模型相同的设备
+        input_ids = input_ids.to(self.device)
 
-        # Set generation parameters
-        temperature = 1.0  # Control randomness (lower = more deterministic)
+        # 避免修改原始 input_ids
+        prompt_input_ids = input_ids.clone()
+        original_input_length = prompt_input_ids.shape[1]
 
-        # Generation loop
-        output_ids = input_ids.clone()
+        # 设置生成参数
+        temperature = 1.0  # 控制随机性 (越低越确定)
 
-        for _ in range(self.max_tokens):
-            # Get only the most recent context to avoid excessive memory usage
-            # Optional, especially useful for longer generations
-            if output_ids.shape[1] > 1024:  # Example context window size
-                context_ids = output_ids[:, -1024:]
-            else:
-                context_ids = output_ids
+        # --- KV Cache 修改开始 ---
+        output_ids = prompt_input_ids  # output_ids 将包含提示和生成的部分
+        past_key_values = None  # 初始化 past_key_values
 
-            with torch.no_grad():  # No need to track gradients during inference
-                outputs = self.model(context_ids)
+        for i in range(self.max_tokens):
+            with torch.no_grad():  # 推理时不需要计算梯度
+                # 如果有 past_key_values，我们只需要将最后一个 token 作为输入
+                if past_key_values is not None:
+                    # 对于后续的 token，输入应该是最后一个生成的 token
+                    current_input_ids = output_ids[:, -1:]  # 形状: (batch_size, 1)
+                else:
+                    # 第一次迭代，输入是完整的提示
+                    current_input_ids = prompt_input_ids
 
-            # Get logits for the last token
+                # 模型调用，传入 past_key_values 并请求返回它们
+                # use_cache=True 是 Hugging Face Transformers 模型启用 KV 缓存的常用参数
+                outputs = self.model(input_ids=current_input_ids,
+                                     past_key_values=past_key_values,
+                                     use_cache=True)  # 确保 use_cache=True
+
+            # 获取最后一个 token 的 logits
+            # outputs.logits 的形状是 (batch_size, sequence_length, vocab_size)
+            # 当使用 KV 缓存时，对于 current_input_ids，其 sequence_length 通常是 1
             next_token_logits = outputs.logits[:, -1, :]
 
-            # Optional: Apply temperature
+            # 可选: 应用温度缩放
             if temperature != 1.0:
                 next_token_logits = next_token_logits / temperature
 
-            # Get the most likely next token
-            next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)
+            # 获取最可能的下一个 token (贪心解码)
+            # next_token 的形状需要是 (batch_size, 1) 以便与 output_ids 连接
+            next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)  # unsqueeze(-1) 确保是 (batch, 1)
 
-            # Append the new token to the sequence
-            output_ids = torch.cat([output_ids, next_token.transpose(0, 1)], dim=1)
+            # 将新 token 附加到序列
+            output_ids = torch.cat([output_ids, next_token], dim=1)
 
-            # Print the current output (optional - can be removed for performance)
-            current_text = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
-            print(f"Generated so far: {current_text}")
+            # 更新 past_key_values 以供下一次迭代使用
+            past_key_values = outputs.past_key_values
+            # --- KV Cache 修改结束 ---
 
-            # Stop if we generate an EOS token
-            if next_token.item() == self.tokenizer.eos_token_id:
+            # (可选) 打印当前输出 - 注意这会解码整个序列，包括提示
+            # 为了性能，在实际应用中可能需要减少打印频率或完全移除
+            current_text_full = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+            print(f"Step {i + 1}: Generated so far (full): {current_text_full}")
+
+            # 如果生成了 EOS token，则停止
+            if self.tokenizer.eos_token_id is not None and next_token.item() == self.tokenizer.eos_token_id:
+                print("EOS token generated. Stopping.")
                 break
 
-        # Get the final generated text
-        generated_text = self.tokenizer.decode(output_ids[0][original_input_length:], skip_special_tokens=True)
-        print(f"\nFinal generated text:\n{generated_text}")
-        sum_tokens = output_ids[0][original_input_length:].shape[0]
-        return output_ids
+        # 获取最终生成的文本 (仅解码新生成的部分)
+        generated_ids = output_ids[0][original_input_length:]
+        generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        print(f"\nFinal generated text (only new part):\n{generated_text}")
+        sum_tokens = generated_ids.shape[0]
+        print(f"Number of tokens generated: {sum_tokens}")
+
+        return output_ids  # 返回包含提示和生成内容的总 IDs
 
     # draft 是一个不断进行树状起草的函数，采用预先分配的kv cache 进行起草工作
     @torch.no_grad()
@@ -533,7 +567,6 @@ class DecodingModel(nn.Module):
                 with cache_manager.lock:
                     outputs = self._verified_update(tree,cache_manager.recv_buffer,outputs)
                     cache_manager.is_update = False
-
             # outputs[0]： 表示的是 logits
             # 第一次推理节点的维度为 size(1,23,32000)
             # size(batch_size, seq_len, vocab_size)
@@ -562,7 +595,7 @@ class DecodingModel(nn.Module):
 
         # prefill phase merged into decoding phase
         init_len = input_ids.shape[1]
-        model = KVCacheModel(self.model, init_input_len=init_len)
+        model = KVCacheModel(self.model,temperature=self.temperature, init_input_len=init_len)
         # Initialize the past key and value states
         # input_ids = model.generate(input_ids)
         # decode phase
@@ -575,7 +608,7 @@ class DecodingModel(nn.Module):
         hit_cache = True
         send_verified_index_buffer = torch.zeros(tree_buffer.buffer_capacity + 2, device=self.device, dtype=torch.int)
         start = time.perf_counter()
-        max_length = 500
+        max_length = 300
         for i in range(max_length):
             if hit_cache is False:
                 # 被拒绝重新请求 cache
@@ -593,7 +626,6 @@ class DecodingModel(nn.Module):
             else:
                 best_candidates = torch.cat([new_sample_token.unsqueeze(0),best_candidates],dim=-1)
             token_ids = model.generate(best_candidates)
-
             # color_print(f"target model 生成 token_ids:{token_ids}",self.rank)
             cache_manager.recv_buffer_for_target_model()
             # [debug]
@@ -681,12 +713,12 @@ class DecodingModel(nn.Module):
             if hit_cache is False:
                 # 被拒绝重新请求 cache
                 color_print(f"hit_cache is {hit_cache}", self.rank)
-                # with self.inference_data.communication_timer:
-                dist.send(query_flag, dst=Config.DRAFTER_RANK)
-                cache_manager.recv_buffer_for_target_model()
-                cache_manager.update_cache_for_target_model()
+                with self.inference_data.communication_timer:
+                    dist.send(query_flag, dst=Config.DRAFTER_RANK)
+                    cache_manager.recv_buffer_for_target_model()
+                    cache_manager.update_cache_for_target_model()
             # 1. query cache
-            with self.inference_data.generate_timer:
+            with self.inference_data.verification_timer:
                 best_candidates, picked_index, root_index = cache_manager.query_cache()
                 best_candidates = torch.tensor(best_candidates, device=self.device, dtype=torch.int).unsqueeze(0)
                 # 2. decode with cache
@@ -694,7 +726,9 @@ class DecodingModel(nn.Module):
                     best_candidates = torch.cat([input_ids, best_candidates], dim=-1)
                 else:
                     best_candidates = torch.cat([new_sample_token.unsqueeze(0), best_candidates], dim=-1)
+            with self.inference_data.generate_timer:
                 token_ids = model.generate(best_candidates)
+                time.sleep(100)
 
             cache_manager.recv_buffer_for_target_model()
             # [debug]
@@ -709,6 +743,7 @@ class DecodingModel(nn.Module):
             # 3.1 update tree buffer
             correct_ids_index_path: list | torch.Tensor = picked_index[:token_ids.shape[0] - 1]
             new_sample_token = token_ids[-1].unsqueeze(0)
+            color_print(f"token_id is {token_ids}",5)
             with self.inference_data.communication_timer:
                 cache_manager.update_cache_for_target_model()
             with self.inference_data.verification_timer:
@@ -731,6 +766,7 @@ class DecodingModel(nn.Module):
                     seq_len = torch.tensor(correct_ids_index_path.shape[0], device=self.device).unsqueeze(0)
                     send_msg = torch.cat([seq_len, new_sample_token, correct_ids_index_path], dim=-1).to(torch.int)
                     self.inference_data.add_acc(seq_len.item())
+                    self.inference_data.add_reject()
 
             # 4. isend message including index info to drafter
             color_print(f" send msg is {send_msg}",2)
@@ -743,7 +779,8 @@ class DecodingModel(nn.Module):
             if self.tokenizer.eos_token_id in token_ids.tolist():
                 break
             # 5.  rollback kv_cache 不能算上 新 sample 出来的token
-            model.rollback(output_token_ids.shape[1] - 1)
+            with self.inference_data.verification_timer:
+                model.rollback(output_token_ids.shape[1] - 1)
             color_print(
                 f"tokens/s is {(output_token_ids.shape[1] - init_len) / (time.perf_counter() - start)}\n output_len is {output_token_ids.shape[1]}",
                 5)
