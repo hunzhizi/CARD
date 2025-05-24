@@ -21,10 +21,8 @@ class ParallelDecodingModel(DecodingModel):
         input_ids = torch.tensor(input_ids).unsqueeze(0).to(self.device)
         if self.parser_args.eval_mode == "two_model":
             if self.is_target_model:
-                generate_ids = self.decoding_with_cache_profile(input_ids, self.nodes_per_layer, self.max_depth)
+                generate_ids = self.decoding_with_cache_sycn(input_ids, self.nodes_per_layer, self.max_depth)
                 # 结束后通知 drafter 结束
-                end_flag = torch.tensor(-1, device=self.model.device, dtype=torch.int)
-                dist.send(end_flag, dst=Config.DRAFTER_RANK)
             if self.is_drafter:
                 self.draft(input_ids, self.nodes_per_layer, self.max_depth)
         elif self.parser_args.eval_mode == "single_model":

@@ -80,6 +80,9 @@ class DecodingModel(nn.Module):
             self.dataset_name = ""
             self.verified_len: int = 0
             self.inference_data = InferenceData(self.rank)
+            self.drafter_forward_time: int = 0
+            self.communication_ratio: int = parser_args.communication_ratio
+            self.sum = 0
             dist.barrier()
             return
         self.model = model
@@ -99,6 +102,7 @@ class DecodingModel(nn.Module):
             torch.cuda.set_device(self.local_rank)
             self.device = torch.device(f"cuda:{self.local_rank}")
             self.is_target_model = True
+            self.combination_buffer = torch.zeros(self.parser_args.max_depth, self.parser_args.nodes_per_layer * 4 + 1, device=self.device)
 
     def _init_single_model_config(self) -> None:
         color_print(f" single model running...")
@@ -147,22 +151,23 @@ class DecodingModel(nn.Module):
         if self.eval_mode == "single_model":
             color_print(f"loading model from {self.parser_args.target_model_dir}")
             device_map = {"": self.device}
-            if self.cuda_device_count == 3:
+            if "70" in self.parser_args.target_model_dir:
+                print("self.parser_args.target_model_dir")
                 config = AutoConfig.from_pretrained(self.parser_args.target_model_dir)
                 num_layers = config.num_hidden_layers
                 split_point = num_layers // 2 + 1
                 device_map = {
-                    "model.embed_tokens": "cuda:1",
-                    **{f"model.layers.{i}": "cuda:1" for i in range(0, split_point)},
-                    **{f"model.layers.{i}": "cuda:2" for i in range(split_point, num_layers)},
-                    "model.norm": "cuda:2",
-                    "model.rotary_emb": "cuda:2",
-                    "lm_head": "cuda:2",
+                    "model.embed_tokens": "cuda:0",
+                    **{f"model.layers.{i}": "cuda:0" for i in range(0, split_point)},
+                    **{f"model.layers.{i}": "cuda:1" for i in range(split_point, num_layers)},
+                    "model.norm": "cuda:1",
+                    "model.rotary_emb": "cuda:1",
+                    "lm_head": "cuda:1",
                 }
-            self.model = AutoModelForCausalLM.from_pretrained(
+            self.model = KVLlamaForCausalLM.from_pretrained(
                 self.parser_args.target_model_dir,
                 device_map=device_map,
-                torch_dtype=torch.float16,
+                torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
             ).eval()
 
@@ -180,24 +185,26 @@ class DecodingModel(nn.Module):
         model_name = 'llama'
         # drafter using the customized model
         if draft_model_path is not None:
+            model_path = draft_model_path
             if 'llama' in draft_model_path.lower():
-                print(f" load llama model")
+                print(f" load llama model from {draft_model_path}")
                 model = KVLlamaForCausalLM.from_pretrained(
                     draft_model_path, **kwargs
                 ).eval()
             if 'qwen' in draft_model_path.lower():
                 model_name = 'qwen'
-                print(f" load qwen model")
+                print(f" load qwen model from {draft_model_path}")
                 model = KVQwen2ForCausalLM.from_pretrained(
                     draft_model_path, **kwargs
                 ).eval()
 
         # target model using the class from transformers lib on huggingface
         elif target_model_path is not None:
+            model_path = target_model_path
             model = AutoModelForCausalLM.from_pretrained(target_model_path,
                                                          **kwargs).eval()
         # cls() 调用 MyClass 的 __init__ 方法创建了一个新实例
-        ret = cls(model, target_model_path, device=main_device)
+        ret = cls(model, model_path, device=main_device)
         ret.model_name = model_name
         return ret
 
@@ -215,8 +222,9 @@ class DecodingModel(nn.Module):
         return attention_mask
 
     @torch.no_grad()
-    def autoregressive_decoding(self,
-                              input_ids: torch.Tensor) -> torch.Tensor:
+    def autoregressive_decoding_native(self,
+                              input_ids: torch.Tensor,
+                                       max_tokens:int = 512) -> torch.Tensor:
         assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
         # 将输入移动到与模型相同的设备
         input_ids = input_ids.to(self.device)
@@ -232,6 +240,8 @@ class DecodingModel(nn.Module):
         output_ids = prompt_input_ids  # output_ids 将包含提示和生成的部分
         past_key_values = None  # 初始化 past_key_values
 
+        if not hasattr(self,"max_tokens"):
+            self.max_tokens = max_tokens
         for i in range(self.max_tokens):
             with torch.no_grad():  # 推理时不需要计算梯度
                 # 如果有 past_key_values，我们只需要将最后一个 token 作为输入
@@ -271,7 +281,7 @@ class DecodingModel(nn.Module):
             # (可选) 打印当前输出 - 注意这会解码整个序列，包括提示
             # 为了性能，在实际应用中可能需要减少打印频率或完全移除
             current_text_full = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
-            print(f"Step {i + 1}: Generated so far (full): {current_text_full}")
+            # print(f"Step {i + 1}: Generated so far (full): {current_text_full}")
 
             # 如果生成了 EOS token，则停止
             if self.tokenizer.eos_token_id is not None and next_token.item() == self.tokenizer.eos_token_id:
@@ -482,6 +492,62 @@ class DecodingModel(nn.Module):
             print(f"{j}..{(time.perf_counter() - start_time)}............")
             j += 1
 
+
+    @torch.no_grad
+    def autoregressive_decoding(self,input_ids: torch.Tensor):
+        input_ids = input_ids.clone()
+        init_len = input_ids.shape[1]
+        generate_ids = input_ids.clone()
+
+        # Initialize the past key and value states
+        if hasattr(self, "past_key_values"):
+            past_key_values = self.past_key_values
+            past_key_values_data = self.past_key_values_data_list
+            current_length_data = self.current_length_data
+            # Reset the past key and value states
+            current_length_data.zero_()
+        else:
+            (
+                past_key_values,
+                past_key_values_data,
+                current_length_data,
+            ) = initialize_past_key_values(self.model)
+            self.past_key_values = past_key_values
+            self.past_key_values_data_list = past_key_values_data
+            self.current_length_data = current_length_data
+        outputs = self.model(
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+        )
+        logits = torch.softmax(outputs[0], dim=-1, dtype=torch.float32)
+        input_ids = torch.argmax(logits[0][-1])
+        input_ids = input_ids.unsqueeze(0).unsqueeze(0)
+        generate_ids = torch.cat([generate_ids, input_ids], dim=-1)
+        start = time.perf_counter()
+        while generate_ids.shape[1]- init_len < self.max_tokens:
+            if self.is_llama:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    past_key_values=past_key_values,
+                )
+            elif self.is_qwen:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    past_key_values=past_key_values,
+                )
+            logits = torch.softmax(outputs[0], dim=-1, dtype=torch.float32)
+            input_ids = torch.argmax(logits[0])
+            input_ids = input_ids.unsqueeze(0).unsqueeze(0)
+            generate_ids = torch.cat([generate_ids, input_ids], dim=-1)
+            if self.tokenizer.eos_token_id is not None and input_ids[0][0].item() == self.tokenizer.eos_token_id:
+                # print("EOS token generated. Stopping.")
+                break
+
+        print(self.tokenizer.decode(generate_ids[0]))
+        end = time.perf_counter()
+        gap = end - start
+        color_print(f"total time is {gap} \n tokens per sec is {(generate_ids.shape[1]- init_len)/gap}")
+        return generate_ids
     # draft 是一个不断进行树状起草的函数，采用预先分配的kv cache 进行起草工作
     @torch.no_grad()
     def draft(self,
@@ -511,8 +577,8 @@ class DecodingModel(nn.Module):
 
         input_len = input_ids.shape[1]
         tree_attention_mask = None
-        print(self.tokenizer.decode(input_ids[0]))
-
+        # print(self.tokenizer.decode(input_ids[0]))
+        recv_buffer = torch.zeros(max_depth + 2, device=self.device, dtype=torch.int)
         # prefill 阶段
         if self.is_llama:
             outputs = self.model(
@@ -522,7 +588,7 @@ class DecodingModel(nn.Module):
                 past_key_values=past_key_values,
                 position_ids=None,
             )
-        if self.is_qwen:
+        elif self.is_qwen:
             outputs = self.model(
                 input_ids=input_ids,
                 past_key_values=past_key_values,
@@ -534,17 +600,15 @@ class DecodingModel(nn.Module):
 
         # 设置树所在的设备
         tree = Tree(verified_len_posi, outputs[0].device, nodes_per_layer=nodes_per_layer, max_depth=max_depth)
-        cache_manager = CacheManager(world_size=self.world_size,rank=self.rank,device=tree.device,tree=tree,is_drafter=True)
+        # cache_manager = CacheManager(world_size=self.world_size,rank=self.rank,device=tree.device,tree=tree,is_drafter=True)
         # decode 阶段，在 decode 阶段，只要没有被完全拒绝，每一次都要处理一层的树节点。
         # 通过 Tree 类进行管理
         input_ids, position_ids, tree_attention_mask, parents = tree.enqueue(
             torch.softmax(outputs[0], dim=-1, dtype=torch.float32))
         tree_attention_mask = self.process_tree_mask(tree_attention_mask, init_len)
         # drafter decoding
-        while cache_manager.is_decoding:
-            # if self.tokenizer.eos_token_id == input_ids:
-            #     break
-            # input_ids = input_ids.unsqueeze(0).unsqueeze(0)
+        max_tokens = self.max_tokens + init_len
+        while self.verified_len < max_tokens:
             if self.is_llama:
                 outputs = self.model(
                     input_ids=input_ids,
@@ -553,20 +617,31 @@ class DecodingModel(nn.Module):
                     past_key_values=past_key_values,
                     position_ids=position_ids,
                 )
-            if self.is_qwen:
+            elif self.is_qwen:
                 outputs = self.model(
                     input_ids=input_ids,
                     attention_mask=tree_attention_mask,
                     past_key_values=past_key_values,
                     cache_position=position_ids,
                 )
+            self.drafter_forward_time += 1
 
+            # if cache_manager.is_update:
+            #     # we need to update the tree buffer
+            #     with cache_manager.lock:
+            #         outputs = self._verified_update(tree,cache_manager.recv_buffer,outputs)
+            #         cache_manager.is_update = False
+            if self.drafter_forward_time % self.communication_ratio == 0:
+                # communication with target model
 
-            if cache_manager.is_update:
-                # we need to update the tree buffer
-                with cache_manager.lock:
-                    outputs = self._verified_update(tree,cache_manager.recv_buffer,outputs)
-                    cache_manager.is_update = False
+                dist.send(tree.get_send_msg_for_drafter(), Config.TARGET_MODEL_RANK)
+                dist.recv(recv_buffer, src=Config.TARGET_MODEL_RANK)
+
+                length = int(recv_buffer[0].item())
+                if length == -1 :
+                    return
+                outputs = self._verified_update(tree,recv_buffer, length,outputs)
+
             # outputs[0]： 表示的是 logits
             # 第一次推理节点的维度为 size(1,23,32000)
             # size(batch_size, seq_len, vocab_size)
@@ -789,6 +864,92 @@ class DecodingModel(nn.Module):
         print(f"outputs are {self.tokenizer.decode(output_token_ids[0])}")
         return output_token_ids
 
+    @torch.no_grad()
+    def decoding_with_cache_sycn(self,
+                                 input_ids: torch.Tensor,
+                                 nodes_per_layer: int = 20,
+                                 max_depth: int = 50):
+        '''
+        decoding with tree_cache for target model
+        Returns:
+
+        '''
+        assert input_ids.shape[0] == 1, "Only support batch size 1 for now!"
+        self.verified_len = input_ids.shape[1]
+        # create tree ,start recv cache
+        tree_buffer = Tree(input_ids.shape[1], self.device, nodes_per_layer, max_depth)
+
+        # cache_manager = CacheManager(self.world_size, self.rank, self.device, tree_buffer, is_target_model=True)
+
+        # prefill phase merged into decoding phase
+        init_len = input_ids.shape[1]
+        model = KVCacheModel(self.model, init_input_len=init_len, temperature=self.temperature)
+        # Initialize the past key and value states
+        # input_ids = model.generate(input_ids)
+        # decode phase
+        output_token_ids = input_ids.clone()
+
+        send_verified_index_buffer = torch.zeros(tree_buffer.buffer_capacity + 2, device=self.device, dtype=torch.int)
+        start = time.perf_counter()
+        max_length = self.max_tokens + init_len
+        best_candidates = input_ids.clone()
+        picked_index = []
+        root_index = -1
+        while output_token_ids.shape[1] < max_length:
+            # 1. decode
+            token_ids = model.generate(best_candidates)
+            dist.recv(self.combination_buffer, src=Config.DRAFTER_RANK)
+            tree_buffer.update_cache_for_target_model(self.combination_buffer)
+            # 保存输出
+            output_token_ids = torch.cat([output_token_ids, token_ids.unsqueeze(0)], dim=-1)
+            # 3.1 update tree buffer
+            correct_ids_index_path: list | torch.Tensor = picked_index[:token_ids.shape[0] - 1]
+            new_sample_token = token_ids[-1].unsqueeze(0)
+            hit_cache = tree_buffer.verified_update_for_target_model(correct_ids_index_path, new_sample_token,
+                                                         root_index=root_index)
+            correct_ids_index_path = torch.tensor(correct_ids_index_path, device=self.device)
+            # hit_cache 如果不为 false 则其为 一个 tensor 里面表示 new_token_idx
+            if hit_cache is not False:
+                # 命中cache
+                #   3.1 acc (could find a path in cache)
+                seq_len = torch.tensor(token_ids.shape[0], device=self.device).unsqueeze(0)
+                pad = torch.tensor(-1, device=self.device).unsqueeze(0)
+                send_msg = torch.cat([seq_len, pad, correct_ids_index_path, hit_cache], dim=-1).to(torch.int)
+                self.inference_data.add_acc(seq_len.item() - 1)
+            else:
+                # 未命中，发送格式
+                # index[0] = -1 序列被拒绝
+                # index[1] 被拒绝后的token
+                #   3.2 reject  (could not find a path in cache)
+                seq_len = torch.tensor(correct_ids_index_path.shape[0], device=self.device).unsqueeze(0)
+                send_msg = torch.cat([seq_len, new_sample_token, correct_ids_index_path], dim=-1).to(torch.int)
+                self.inference_data.add_acc(seq_len.item())
+                self.inference_data.add_reject()
+            if self.tokenizer.eos_token_id in token_ids.tolist():
+                send_verified_index_buffer[0] = -1
+                dist.send(send_verified_index_buffer, dst=Config.DRAFTER_RANK)
+                break
+            send_verified_index_buffer[0:send_msg.shape[0]].copy_(send_msg)
+            # dist.send(send_msg, dst=Config.DRAFTER_RANK)
+            dist.send(send_verified_index_buffer, dst=Config.DRAFTER_RANK)
+
+            # 5.  rollback kv_cache 不能算上 新 sample 出来的token
+            model.rollback(output_token_ids.shape[1] - 1)
+            best_candidates, picked_index, root_index = tree_buffer.get_candidates_for_target_model()
+            best_candidates = torch.tensor(best_candidates, device=self.device, dtype=torch.int).unsqueeze(0)
+            best_candidates = torch.cat([new_sample_token.unsqueeze(0), best_candidates], dim=-1)
+
+        color_print(
+            f"tokens/s is {(output_token_ids.shape[1] - init_len) / (time.perf_counter() - start)}\n exe time is {time.perf_counter() - start}\n new output_len is {output_token_ids.shape[1] - init_len}",
+            5)
+        self.inference_data.get_inference_data(is_store=True,
+                                               file_path='/home/TreeDecoding/benchmark/exp/test/test.jsonl')
+        # print(f"outputs are {self.tokenizer.decode(output_token_ids[0])}")
+        return output_token_ids
+
+
+
+
     def _rollback_kv_cache(self,
                            correct_ids_index_path: torch.Tensor,
                            nodes_per_layer: int,
@@ -822,12 +983,12 @@ class DecodingModel(nn.Module):
     # 由目标模型传过来的正确的更新序列
     def _verified_update(self, tree: Tree,
                          correct_ids_index_path: torch.Tensor,
+                         length: int ,
                          outputs) -> torch.Tensor:
         # 规定 在 tensor 第一个位置为标志位
         # 标志位 index[0] > 0:index[0]为验证序列长度
         # 标志位 index[1] != 0 ： 序列被拒绝， 注意，当序列被拒绝不一定长度为1 且该值为 拒绝后的token_id
-        color_print(f"correct_ids_index_path is {correct_ids_index_path}",3)
-        length = int(correct_ids_index_path[0].item())
+        # color_print(f"correct_ids_index_path is {correct_ids_index_path}",3)
         flag = int(correct_ids_index_path[1].item())
         # 正确的 token ids  index 序列
         correct_ids_index_path = correct_ids_index_path[2:length + 2]
@@ -842,11 +1003,12 @@ class DecodingModel(nn.Module):
             # 先回滚，然后携带正确 token 正常推理一次，更新树
             self._rollback_kv_cache(correct_ids_index_path, tree.nodes_per_layer, is_reject=True)
             input_id = torch.tensor(flag,dtype=torch.int, device=self.device).unsqueeze(0).unsqueeze(0)
-            color_print(f"被拒绝后进行推理的 tokenid is{input_id}",3)
+            # color_print(f"被拒绝后进行推理的 tokenid is{input_id}",3)
             outputs = self.model(
                 input_ids=input_id,
                 past_key_values=self.past_key_values,
             )
+            self.drafter_forward_time += 1
             # 此时verified_update 在tree会跳过一层layer
             tree.verified_update(correct_ids_index_path, is_reject=True)
             self.verified_len += 1
@@ -857,12 +1019,13 @@ class DecodingModel(nn.Module):
         # 更新树
         is_having_zero_weight = tree.verified_update(correct_ids_index_path)
         if is_having_zero_weight is not None:
+            self.drafter_forward_time += 1
             parent_id = is_having_zero_weight
             # 1. kv-cache truncated
             length = self.verified_len + tree.nodes_per_layer * tree.size
             self._kv_cache_truncate(length)
             # 2. enqueue using level_2_cache
-            color_print(f"using level_2_cache enqueue, parent id is {parent_id}")
+            # color_print(f"using level_2_cache enqueue, parent id is {parent_id}")
             input_ids, position_ids, tree_attention_mask, parents = tree.enqueue_using_level2cache(parent_id)
             # 3. send message
             # I don't send message I will change the communication method
@@ -882,6 +1045,5 @@ class DecodingModel(nn.Module):
                     past_key_values=self.past_key_values,
                     cache_position=position_ids,
                 )
-
-            color_print("divergence")
+            # color_print("divergence")
         return outputs

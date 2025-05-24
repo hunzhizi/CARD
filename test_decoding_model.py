@@ -2,6 +2,7 @@ import time
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+from drafter_decoding.Config import Config
 from drafter_decoding.DecodingModel import DecodingModel
 import torch
 
@@ -10,8 +11,8 @@ from drafter_decoding.modeling_llama_kv import LlamaForCausalLM as KVLlamaForCau
 
 # base_model_path = "/mnt/data/zhouShaoRepo/EAGLE/eagle/model_weight/base_model"
 # base_model_path = "/mnt/data/zhouShaoRepo/model/Llama-3.1-8B-Instruct"
-base_model_path = "/hy-tmp/Llama-3.1-8B-Instruct"
-# base_model_path = "/hy-tmp/Llama-3.2-1B-Instruct"
+base_model_path = Config.MODEL_DIR + "/Llama-3.1-8B-Instruct"
+# base_model_path = Config.MODEL_DIR + "/Llama-3.2-1B-Instruct"
 # base_model_path = "/mnt/data/zhouShaoRepo/model/Qwen2.5-7B-Instruct"
 # base_model_path = "/home/ps/.cache/huggingface/hub/models--qwen--qwen2.5-3b-instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1"
 draft_model_path = "/mnt/data/zhouShaoRepo/model/llama-68m"
@@ -34,9 +35,41 @@ def test_draft_single_card():
     print(f"model.tokenizer.decode([0]) is {model.tokenizer.decode([0])}")
     input_ids = torch.as_tensor(input_ids).cuda()
     model.device = 'cuda'
+    output_ids=model.draft_single_card_test(input_ids,nodes_per_layer=20)
+    # output_ids=model.draft_single_card_test_qwen(input_ids,nodes_per_layer=20)
+    # output_ids=model.autoregressive_decoding(input_ids)
+    output=model.tokenizer.decode(output_ids[0])
+
+    print(output)
+
+def test_autoregressive_decoding_bsline():
+    import os
+    # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:32"
+    # os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "true"
+    # os.environ["DISABLE_FLASH_ATTN"] = "1"  # 专门禁用Flash Attention
+
+    model = DecodingModel.from_pretrained(
+        target_model_path=base_model_path,
+        main_device='cuda',
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+        device_map="auto",
+        # use_flash_attention_2=False,  # 禁用Flash Attention 2
+    )
+    model.eval()
+    model.is_llama = True
+    # your_message = "Hello, tell me a story about a man who lost his way in the forest and found a treasure."
+    your_message="tell me a story about Little bear."
+    input_ids = model.tokenizer([your_message]).input_ids
+    print(f"model.tokenizer.decode([0]) is {model.tokenizer.decode([0])}")
+    input_ids = torch.as_tensor(input_ids).cuda()
+    model.device = 'cuda'
     # output_ids=model.draft_single_card_test(input_ids,nodes_per_layer=20)
     # output_ids=model.draft_single_card_test_qwen(input_ids,nodes_per_layer=20)
-    output_ids=model.autoregressive_decoding(input_ids)
+    start = time.perf_counter()
+    output_ids=model.autoregressive_decoding_native(input_ids)
+    gap = time.perf_counter() - start
+    print(f" tokens/s is {512/gap}")
     output=model.tokenizer.decode(output_ids[0])
 
     print(output)
@@ -154,10 +187,11 @@ def test_qwen():
 
 
 if __name__ == '__main__':
-    start = time.perf_counter()
-    output_ids, generated_text,sum_tokens = test_autoregressive_decoding()
-    gap = time.perf_counter() - start
-    print(f"执行时间 is {gap},生成 tokens{sum_tokens}, tokens/s = { sum_tokens/gap}")
+    # start = time.perf_counter()
+    # output_ids, generated_text,sum_tokens = test_autoregressive_decoding()
+    # gap = time.perf_counter() - start
+    # print(f"执行时间 is {gap},生成 tokens{sum_tokens}, tokens/s = { sum_tokens/gap}")
     # test_draft_single_card()
+    test_autoregressive_decoding_bsline()
     # test_qwen()
 

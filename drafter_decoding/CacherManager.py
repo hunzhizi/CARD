@@ -91,19 +91,13 @@ class CacheManager:
                                 self.tree_buffer.global_condition.wait()
                                 color_print(f"_get_recv_thread 准备 send tree buffer state")
                                 # send_msg = self.tree_buffer.get_send_msg_for_drafter()
-                                work = dist.isend(self.tree_buffer.get_send_msg_for_drafter(), Config.TARGET_MODEL_RANK)
-                                while not work.is_completed():
-                                    # print("未获取锁")
-                                    time.sleep(0.001)
+                                dist.send(self.tree_buffer.get_send_msg_for_drafter(), Config.TARGET_MODEL_RANK)
                             color_print(f"_get_recv_thread send tree buffer state {send_msg}")
                         if handshake_val == 0:
                             continue
                         else:
                             color_print(f"handshake_flag is {handshake_val}, 准备 recv msg from target model")
-                            work = dist.irecv(self.recv_buffer, src=Config.TARGET_MODEL_RANK)
-                            while not work.is_completed():
-                                # print("未获取锁")
-                                time.sleep(0.001)
+                            dist.recv(self.recv_buffer, src=Config.TARGET_MODEL_RANK)
                             color_print(f"获取 self.lock 进行self.is_update 的修改")
                             with self.lock:
                                 self.is_update = True  # 可能有线程安全， 但是概率极低

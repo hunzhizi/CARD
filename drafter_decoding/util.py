@@ -43,6 +43,8 @@ def model_map(args):
         "Llama-3.2-3B-Instruct": f"{Config.MODEL_DIR}/Llama-3.2-3B-Instruct",
         "Llama-3.1-8B-Instruct": f"{Config.MODEL_DIR}/Llama-3.1-8B-Instruct",
         "Llama-3.1-70B-Instruct": f"{Config.MODEL_DIR}/Llama-3.1-70B-Instruct",
+        "Llama-2-7b-chat-hf": f"{Config.MODEL_DIR}/Llama-2-7b-chat-hf",
+        "Llama-2-70b-chat-hf": f"{Config.MODEL_DIR}/Llama-2-70b-chat-hf",
     }
     # caution: all the models' vocab size should be the same
     args.draft_models_dir = [model_dir_map[model_name] for model_name in args.draft_models]
@@ -76,13 +78,14 @@ def parse_arguments():
     parser.add_argument('--seed', '-s', type=int, default=1234,
                         help='set a random seed, which can makes the result reproducible')
     parser.add_argument('--max_tokens', type=int, default=1024, help='max token number generated.')
-    parser.add_argument('--temperature', type=float, default=0.2, help='temperature for generating new tokens.')
+    parser.add_argument('--temperature', type=float, default=0, help='temperature for generating new tokens.')
     parser.add_argument('--top_k', type=int, default=0, help='top_k for ungreedy sampling strategy.')
     parser.add_argument('--top_p', type=float, default=0.95, help='top_p for ungreedy sampling strategy.')
     # 框架设置相关
     parser.add_argument("--branch-prediction-num", type=int, default=2, help="branch prediction number for smallest drafter.")
     parser.add_argument("--nodes_per_layer", type=int, default=20, help="tree buffer's nodes number per layer.")
     parser.add_argument("--max_depth", type=int, default=50, help="tree buffer's max depth")
+    parser.add_argument("--communication_ratio", type=int, default=2, help="communication_ratio between drafter and target model")
 
     args = parser.parse_args()
     args.exp_name = os.path.join(os.getcwd(), "exp", args.exp_name)

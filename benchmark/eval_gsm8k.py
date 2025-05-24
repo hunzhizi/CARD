@@ -181,7 +181,7 @@ class EvalGSM8K(DecodingModel):
                 datum["input_ids"] = torch.tensor(input_ids).unsqueeze(0)
                 datum["ground_truth"] = self.extract_answer_from_output(datum["answer"])
                 data.append(datum)
-        self.data = data[:100]
+        self.data = data[10:15]
 
         # random.shuffle(self.data)
         self.data = self.data
@@ -237,16 +237,12 @@ class EvalGSM8K(DecodingModel):
             acc = 0
             for idx, datum in tqdm.tqdm(enumerate(self.data), total=len(self.data), disable=not self.is_target_model, ncols=50):
                 input_ids = datum["input_ids"].to(self.device)
-                print(input_ids)
                 torch.cuda.synchronize()
                 if self.parser_args.eval_mode == "two_model":
                     if self.is_target_model:
                         start_time = time.time()
-                        generate_ids = self.decoding_with_cache_profile(input_ids, self.nodes_per_layer, self.max_depth)
+                        generate_ids = self.decoding_with_cache_sycn(input_ids, self.nodes_per_layer, self.max_depth)
                         end_time = time.time()
-                        # 结束后通知 drafter 结束
-                        end_flag = torch.tensor(-1, device=self.model.device, dtype=torch.int)
-                        dist.send(end_flag, dst=Config.DRAFTER_RANK)
                     if self.is_drafter:
                         self.draft(input_ids, self.nodes_per_layer, self.max_depth)
                 elif self.parser_args.eval_mode == "single_model":
@@ -257,8 +253,7 @@ class EvalGSM8K(DecodingModel):
                 dist.barrier()
                 if self.is_target_model:
                     answer = self.postprocess(datum["input_text"], self.tokenizer.decode(generate_ids[0, :]))
-                    print(self.tokenizer.decode(generate_ids[0, :]))
-                    # assert answer != self.INVALID_ANS, self.color_print(f"Invalid Answer!\n question:\n{datum['question']}\nanswer:\n{answer}", 1)
+                    # print(self.tokenizer.decode(generate_ids[0, :]))
                     if answer == datum["ground_truth"]:
                         acc += 1
                     out_f.write(json.dumps({"question": datum["question"], "time": end_time-start_time, "new_tokens": generate_ids.shape[1] - input_ids.shape[1], "ground_truth": datum["ground_truth"], "answer": answer}, ensure_ascii=False) + "\n")

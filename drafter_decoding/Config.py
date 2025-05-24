@@ -4,13 +4,7 @@ class Config:
     DRAFTER_RANK = 0
     _heng_yuan_yun = "/hy-tmp"
     _3090ti = "/mnt/data/zhouShaoRepo/model"
+    auto_dl = "/root/autodl-tmp"
     MODEL_DIR = _heng_yuan_yun
     PREDICTION_NUM = 1
 
-if __name__ == '__main__':
-    import torch
-    tree_state = torch.zeros(50, 1)
-    tree_state[0][0] = 1
-    tree_state[1][0] = 2
-    tree_state[2][0] = 3
-    print(tree_state)

@@ -46,6 +46,7 @@ class KVCacheModel(nn.Module):
         self.logits_processor = None
         if temperature > 1e-5:
             self.logits_processor = prepare_logits_processor(temperature=temperature, top_p=top_p, top_k=top_k)
+            print(f"decoding temperature is {temperature}")
 
         self.sum = 0
         self.device = model.device
@@ -118,7 +119,7 @@ class KVCacheModel(nn.Module):
             outputs = self._model(input_ids)
             # send msg to get tree info asynchronously
             # 这里其实不太符合开闭原则,但是为了 asynchronously 最好是在这里进行tree info 的获取
-            dist.isend(self.handshake_flag,dst=Config.DRAFTER_RANK)
+            # dist.isend(self.handshake_flag,dst=Config.DRAFTER_RANK)
 
             # logit shape is (batch_size, sequence_length, vocab_size)
             if (outputs.logits.dim() == 2):
@@ -140,19 +141,20 @@ class KVCacheModel(nn.Module):
                 new_input_id = torch.unsqueeze(new_input_id, 0)
 
             # 进行推理，传入当前 token_id 和 past_key_values ,使用use_cache 进行推理
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
+            # start_event = torch.cuda.Event(enable_timing=True)
+            # end_event = torch.cuda.Event(enable_timing=True)
+            # start_event.record()
             outputs = self._model(input_ids=new_input_id,
                                   past_key_values=self._past_key_values,
                                   use_cache=True)
-            end_event.record()
-            torch.cuda.synchronize()
-            self.sum += start_event.elapsed_time(end_event) / 1000
-            print(f"generate time is {self.sum}")
+            # end_event.record()
+            # torch.cuda.synchronize()
+            # self.sum += start_event.elapsed_time(end_event) / 1000
+            # print(f"generate time is {self.sum}")
+
             # send msg to get tree info asynchronously
             # 这里其实不太符合开闭原则,但是为了 asynchronously 最好是在这里进行tree info 的获取
-            dist.isend(self.handshake_flag,dst=Config.DRAFTER_RANK)
+            # dist.isend(self.handshake_flag,dst=Config.DRAFTER_RANK)
             logits = outputs.logits
 
             if logits.dim() == 2:

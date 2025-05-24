@@ -67,7 +67,7 @@ class KVCache:
 
 
 def initialize_past_key_values(model,
-                               max_length: int = 4096):
+                               max_length: int = 8192):
     """
     Initialize past key and value states for a given transformer model.
 

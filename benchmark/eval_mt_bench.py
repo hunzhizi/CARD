@@ -41,8 +41,8 @@ class EvalMTBench(DecodingModel):
         self.seed_set = set()
 
         self.model_id = "llama-3.1"
-        # if "Llama-2" in self.parser_args.draft_model and "Llama-2" in self.parser_args.target_model:
-        #     self.model_id = "llama-2-chat"
+        if "Llama-2" in self.parser_args.target_model_dir :
+            self.model_id = "llama-2-chat"
         # elif "vicuna" in self.parser_args.draft_model and "vicuna" in self.parser_args.target_model:
         #     self.model_id = "vicuna"
         # elif "Llama-3.1" in self.parser_args.draft_model and "Llama-3.1" in self.parser_args.target_model:
@@ -58,7 +58,7 @@ class EvalMTBench(DecodingModel):
             for line in f.readlines():
                 datum = json.loads(line)
                 data.append(datum)
-        self.data = data
+        self.data = data[:10]
 
     def preprocess(self, input_text):
         pass
@@ -68,7 +68,6 @@ class EvalMTBench(DecodingModel):
 
     @torch.no_grad()
     def eval(self):
-        # if self.parser_args.eval_mode == "two_model":
         out_path = os.path.join(self.parser_args.exp_name, f"{self.parser_args.eval_mode}_mt_bench.jsonl")
         out_f = open(out_path, "a")
 
@@ -119,12 +118,9 @@ class EvalMTBench(DecodingModel):
                     if self.parser_args.eval_mode == "two_model":
                         if self.is_target_model:
                             start_time = time.time()
-                            output_ids = self.decoding_with_cache(input_ids, self.nodes_per_layer,
-                                                                            self.max_depth)
+                            output_ids = self.decoding_with_cache_sycn(input_ids, self.nodes_per_layer,
+                                                                       self.max_depth)
                             end_time = time.time()
-                            # 结束后通知 drafter 结束
-                            end_flag = torch.tensor(-1, device=self.model.device, dtype=torch.int)
-                            dist.send(end_flag, dst=Config.DRAFTER_RANK)
                         if self.is_drafter:
                             self.draft(input_ids, self.nodes_per_layer, self.max_depth)
                     elif self.parser_args.eval_mode == "single_model":
